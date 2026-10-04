@@ -110,14 +110,17 @@ local function scene(setup: (any, any) -> ())
 	return world, world.coreGui.TouchPeak
 end
 
--- Gestures tab while pinching with two fingers.
+-- Gestures tab while flying with the joystick and zooming with the slider.
 writeScene(
 	"gestures",
-	scene(function(_, app)
-		app.overlay:TouchBegan("a", Vector2.new(420, 400))
-		app.overlay:TouchBegan("b", Vector2.new(640, 330))
+	scene(function(world, app)
+		local navigator = world.coreGui.TouchPeak.TouchPeakNavigator
+		local stick, rail = navigator.Stick, navigator.Rail
+		app.navigator:_move("stick", stick.AbsolutePosition + stick.AbsoluteSize / 2 + Vector2.new(34, -22))
+		app.navigator:_move("rail", rail.AbsolutePosition + rail.AbsoluteSize / 2 + Vector2.new(0, -30))
+		app.overlay:TouchBegan("a", Vector2.new(560, 300))
 		app.panel:SetTouchDetected(true)
-		app.panel:SetTouchCount(2)
+		app.panel:SetTouchCount(1)
 		app.panel:SetGesture("zoom")
 		app.overlay:ShowGesture(app.locale:gesture("zoom"))
 		app.overlay:Toast(app.locale:t("toastSelected", "Domek"))
@@ -157,7 +160,6 @@ writeScene(
 				button.Activated:Fire()
 			end
 		end
-		app.modeBar:SetMode("pan", true)
 		app.panel:SetTouchCount(1, true)
 		app.panel:SetGesture("pan")
 		app.panel:SetInputStats({

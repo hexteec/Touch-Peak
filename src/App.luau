@@ -23,9 +23,12 @@ local SelectionController = require(script.Parent.Selection.SelectionController)
 local Theme = require(script.Parent.UI.Theme)
 local Overlay = require(script.Parent.UI.Overlay)
 local Panel = require(script.Parent.UI.Panel)
-local ModeBar = require(script.Parent.UI.ModeBar)
+local Navigator = require(script.Parent.UI.Navigator)
 
 local STATS_REFRESH = 0.25 -- s between diagnostics updates
+-- A tap followed by a drag is a zoom, not a selection: undo the tap's selection
+-- if the drag starts within this time.
+local TAP_UNDO_WINDOW = 1
 
 local App = {}
 App.__index = App
@@ -44,7 +47,7 @@ function App.new(plugin: Plugin)
 	self._open = false
 	self._active = false
 	self._touchDetected = UserInputService.TouchEnabled
-	self._oneFingerMode = "rotate"
+	self._beforeTap = nil -- { selection, time } saved by the last tap
 	self._statsScheduled = false
 	self._mouseOnlyHintShown = false
 
@@ -60,7 +63,7 @@ function App.new(plugin: Plugin)
 	self.input = TouchInput.new(self.recognizer, {
 		isBlocked = function(position)
 			return (self.panel ~= nil and self.panel:ContainsPoint(position))
-				or (self.modeBar ~= nil and self.modeBar:ContainsPoint(position))
+				or (self.navigator ~= nil and self.navigator:ContainsPoint(position))
 		end,
 		mouseEnabled = function()
 			return self.settings:Get("mouseInput")
@@ -93,11 +96,9 @@ function App:Open()
 	end
 	self._open = true
 	self:_ensureGui()
-	-- Opening always shows the full window (it can be collapsed from there)
-	-- and starts in the default one-finger mode.
+	-- Opening always shows the full window; it can be collapsed from there.
 	self.panel:SetCollapsed(false, true)
 	self.panel:SetVisible(true)
-	self:_setOneFingerMode("rotate")
 	self:SetActive(true)
 	self.OpenChanged:Fire(true)
 end
@@ -128,9 +129,7 @@ function App:SetActive(active: boolean)
 		self._plugin:Activate(true)
 		self.input:Start()
 		self._heartbeat = RunService.Heartbeat:Connect(function(dt)
-			-- Both fingers have reported by now: apply this frame's two-finger movement.
-			self.recognizer:Flush()
-			self.camera:Step(dt)
+			self:_step(dt)
 		end)
 	else
 		self.input:Stop()
@@ -155,21 +154,34 @@ function App:SetActive(active: boolean)
 		self.panel:SetTouchCount(0)
 		self.panel:SetGesture(nil)
 	end
-	self:_refreshModeBar()
+	self:_refreshNavigator()
 end
 
-function App:_setOneFingerMode(mode: string)
-	self._oneFingerMode = mode
-	self.recognizer:SetOneFingerMode(mode)
-	if self.modeBar then
-		self.modeBar:SetMode(mode)
+-- Runs every frame while touch controls are active.
+function App:_step(dt: number)
+	-- Both fingers have reported by now: apply this frame's two-finger movement.
+	self.recognizer:Flush()
+
+	local navigator = self.navigator
+	if navigator then
+		navigator:Step()
+		local pan = navigator:GetPan()
+		if pan.Magnitude > 0 then
+			self.camera:Slide(pan, dt)
+		end
+		local zoom = navigator:GetZoom()
+		if zoom ~= 0 then
+			self.camera:RailZoom(zoom, dt)
+		end
 	end
+
+	self.camera:Step(dt)
 end
 
--- The mode bar is only useful while touch controls are running.
-function App:_refreshModeBar()
-	if self.modeBar then
-		self.modeBar:SetVisible(self._open and self._active and self.settings:Get("showModeBar"))
+-- The joystick is only useful while touch controls are running.
+function App:_refreshNavigator()
+	if self.navigator then
+		self.navigator:SetVisible(self._open and self._active and self.settings:Get("showNavigator"))
 	end
 end
 
@@ -215,19 +227,25 @@ function App:_ensureGui()
 
 	self.overlay = Overlay.new(gui, self.settings)
 	self:_createPanel()
-	self:_createModeBar()
+	self:_createNavigator()
 end
 
-function App:_createModeBar()
-	self.modeBar = ModeBar.new({
+function App:_createNavigator()
+	local navigator = Navigator.new({
 		parent = self.gui,
 		locale = self.locale,
-		mode = self._oneFingerMode,
-		onModeChanged = function(mode)
-			self:_setOneFingerMode(mode)
-		end,
 	})
-	self:_refreshModeBar()
+	-- Pan and zoom aim at whatever is in the middle of the screen.
+	local function anchorAtCenter()
+		local camera = Workspace.CurrentCamera
+		if camera then
+			self.camera:AnchorAt(camera.ViewportSize / 2)
+		end
+	end
+	navigator.PanBegan:Connect(anchorAtCenter)
+	navigator.ZoomBegan:Connect(anchorAtCenter)
+	self.navigator = navigator
+	self:_refreshNavigator()
 end
 
 function App:_createPanel()
@@ -261,16 +279,16 @@ function App:_rebuildPanel()
 	self:_createPanel()
 	self.panel:SetCollapsed(wasCollapsed, true)
 	self.panel:SetVisible(wasVisible, true)
-	if self.modeBar then
-		self.modeBar:Destroy()
-		self:_createModeBar()
+	if self.navigator then
+		self.navigator:Destroy()
+		self:_createNavigator()
 	end
 end
 
 function App:_destroyGui()
-	if self.modeBar then
-		self.modeBar:Destroy()
-		self.modeBar = nil
+	if self.navigator then
+		self.navigator:Destroy()
+		self.navigator = nil
 	end
 	if self.panel then
 		self.panel:Destroy()
@@ -358,6 +376,9 @@ function App:_bindGestures()
 	maid:Give(recognizer.LongPress:Connect(function(position)
 		self:_onLongPress(position)
 	end))
+	maid:Give(recognizer.TapDragBegan:Connect(function()
+		self:_undoTapSelection()
+	end))
 
 	-- Status readouts.
 	maid:Give(recognizer.GestureChanged:Connect(function(gesture)
@@ -402,7 +423,7 @@ function App:_maybeExplainMouseOnly()
 		return
 	end
 	self._mouseOnlyHintShown = true
-	if self.overlay and self.settings:Get("showModeBar") then
+	if self.overlay then
 		self.overlay:Toast(self.locale:t("toastMouseOnly"), Theme.Color.Warning)
 	end
 end
@@ -419,17 +440,14 @@ function App:_bindSettings()
 			end)
 		elseif key == "showTouches" and not value and self.overlay then
 			self.overlay:ClearTouches()
-		elseif key == "showModeBar" then
-			if not value then
-				-- Without the bar there is no way back, so fall back to rotating.
-				self:_setOneFingerMode("rotate")
-			end
-			self:_refreshModeBar()
+		elseif key == "showNavigator" then
+			self:_refreshNavigator()
 		end
 	end))
 end
 
 function App:_onTap(position: Vector2)
+	self._beforeTap = { selection = self.selection:Get(), time = os.clock() }
 	local target = self.selection:SelectAt(position)
 	local overlay = self.overlay
 	if not overlay then
@@ -440,6 +458,18 @@ function App:_onTap(position: Vector2)
 		overlay:Toast(self.locale:t("toastSelected", target.Name), Theme.Color.Accent)
 	else
 		overlay:Toast(self.locale:t("toastCleared"), Theme.Color.TextDim)
+	end
+end
+
+-- The tap that started a tap-and-drag zoom should not have changed the selection.
+function App:_undoTapSelection()
+	local saved = self._beforeTap
+	self._beforeTap = nil
+	if saved and os.clock() - saved.time <= TAP_UNDO_WINDOW then
+		self.selection:Set(saved.selection)
+		if self.overlay then
+			self.overlay:HideToast()
+		end
 	end
 end
 

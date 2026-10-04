@@ -87,4 +87,8 @@ function SelectionController:Get(): { Instance }
 	return Selection:Get()
 end
 
+function SelectionController:Set(instances: { Instance })
+	Selection:Set(instances)
+end
+
 return SelectionController

@@ -155,29 +155,43 @@ function Icons.longPress()
 	return icon, tweens
 end
 
--- A tiny mode bar whose highlight steps between its three buttons.
-function Icons.modes()
+-- A tap mark, then the finger sliding up from it.
+function Icons.tapDrag()
 	local icon = canvas()
+	local mark = Create.ring(14, Color.Accent, 0.35, 1.5, UDim2.fromScale(0.5, 0.74))
+	mark.Parent = icon
 	Create("Frame", {
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromOffset(14, 30),
-		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.fromScale(0.5, 0.74),
+		Size = UDim2.new(0, 2, 0.48, 0),
+		BackgroundColor3 = Color.White,
+		BackgroundTransparency = 0.8,
 		Parent = icon,
-	}, {
-		Create.corner(7),
-		Create.stroke(Color.White, 0.7, 1.5),
 	})
-	for _, y in { 0.27, 0.5, 0.73 } do
-		local dot = Create.dot(4, Color.White, UDim2.fromScale(0.5, y))
-		dot.BackgroundTransparency = 0.6
-		dot.Parent = icon
-	end
-	local highlight = Create.dot(8, Color.Accent, UDim2.fromScale(0.5, 0.27))
-	highlight.Parent = icon
+	local dot = finger(UDim2.fromScale(0.5, 0.74))
+	dot.Parent = icon
 
 	local tweens = {
-		loop(highlight, 1.4, { Position = UDim2.fromScale(0.5, 0.73) }, Enum.EasingStyle.Quint, true),
+		loop(dot, 0.9, { Position = UDim2.fromScale(0.5, 0.26) }, Enum.EasingStyle.Quad, true),
+	}
+	return icon, tweens
+end
+
+-- A joystick knob circling inside its base.
+function Icons.joystick()
+	local icon = canvas()
+	Create.ring(28, Color.White, 0.65, 1.5).Parent = icon
+	local spinner = Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Parent = icon,
+	})
+	Create.dot(12, Color.Accent, UDim2.new(0.5, 0, 0.5, -6)).Parent = spinner
+
+	local tweens = {
+		loop(spinner, 2.2, { Rotation = 360 }, Enum.EasingStyle.Linear),
 	}
 	return icon, tweens
 end

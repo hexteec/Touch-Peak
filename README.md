@@ -19,27 +19,29 @@
 
 | Gest | Co robi |
 | --- | --- |
-| ☝️ **Jeden palec** – przesuwanie | Obraca kamerę wokół punktu na środku ekranu (orbita) |
+| ☝️ **Jeden palec** – przesuwanie | Obraca kamerę wokół punktu na środku ekranu (orbita) albo w miejscu |
+| 👆↕️ **Stuknij, potem przeciągnij** | Zoom jednym palcem: w górę przybliża, w dół oddala (jak w Mapach Google) |
+| 🕹️ **Joystick** (lewy dolny róg) | Kamera leci w stronę wychylenia – im dalej, tym szybciej |
+| 🎚️ **Suwak zoomu** (obok joysticka) | W górę – przybliża, w dół – oddala, płynnie dopóki trzymasz |
 | 🤏 **Dwa palce** – rozsuwanie / zsuwanie | Przybliża / oddala w stronę punktu między palcami |
 | ✌️ **Dwa palce** – w tę samą stronę | Przesuwa widok (pan) – świat „trzyma się” palców |
 | 👆 **Stuknięcie** | Zaznacza obiekt (jak kliknięcie w Studio); stuknięcie w pustkę odznacza |
 | 👆👆 **Podwójne stuknięcie** | Zaznacza obiekt i płynnie ustawia na nim kamerę |
 | ✋ **Przytrzymanie** | Dodaje obiekt do zaznaczenia albo go z niego usuwa |
 
-### Pasek trybów – wszystko jednym palcem
+### Dlaczego jednym palcem?
 
 Roblox Studio na Windows zwykle przekazuje pluginom ekran dotykowy **jako mysz**: widzi tylko
 jeden palec, a drugi w ogóle do pluginu nie dociera (to ograniczenie Studio, nie da się go
-obejść z poziomu pluginu). Dlatego przy lewej krawędzi widoku jest **pasek trybów**:
+obejść z poziomu pluginu). Dlatego wszystko da się zrobić jednym palcem, bez przełączania trybów:
 
-| Tryb | Przeciągnięcie jednym palcem |
-| --- | --- |
-| **Obrót** | obraca kamerę |
-| **Przesuń** | przesuwa widok (pan) |
-| **Zoom** | w górę – przybliża, w dół – oddala (w stronę miejsca, gdzie położysz palec) |
+- **obrót** – zwykłe przeciągnięcie,
+- **zoom** – stuknij i od razu przeciągnij w górę/dół (przybliża w stronę miejsca, gdzie
+  dotknąłeś; samo stuknięcie nie zmieni wtedy zaznaczenia) albo suwak,
+- **przesuwanie** – joystick: pchnij i trzymaj, kamera leci w tę stronę.
 
-Stuknięcia, podwójne stuknięcia i przytrzymanie działają w każdym trybie. Jeśli Twoje
-urządzenie jednak przekazuje dwa palce, gesty dwoma palcami działają niezależnie od paska.
+Jeśli Twoje urządzenie jednak przekazuje dwa palce, gesty dwoma palcami działają dodatkowo,
+a joystick można trzymać jedną ręką i jednocześnie obracać kamerę drugą.
 
 Dodatkowo:
 
@@ -80,7 +82,7 @@ widokiem 3D, a sterowanie dotykiem od razu się włączy.
 | Zaznaczaj całe modele | Stuknięcie części modelu zaznacza cały model (jak w Studio); wyłączone – samą część |
 | Pokazuj dotyk | Kółka pod palcami i fala po stuknięciu |
 | Mysz i rysik | Lewy przycisk myszy / rysik działa jak jeden palec – **zostaw włączone**, jeśli Studio podaje dotyk jako mysz |
-| Pasek trybów | Pokazuje pasek Obrót / Przesuń / Zoom przy lewej krawędzi |
+| Joystick i suwak zoomu | Pokazuje joystick i suwak w lewym dolnym rogu widoku |
 | Język | Auto (polski, gdy Studio lub system jest po polsku), PL albo EN |
 
 Wszystkie ustawienia zapisują się w Studio i przetrwają restart.
@@ -118,7 +120,7 @@ Przycisk działa bez ikony. Żeby ją dodać, wgraj [`assets/icon.png`](assets/i
   - **Dotyk – maks. palców: 2** (na zielono) → Studio podaje prawdziwy multi-touch, działają
     gesty dwoma palcami.
   - **Dotyk: 0 zdarzeń**, a rośnie **Mysz** → Studio zamienia dotyk na mysz (jeden palec).
-    W statusie zamiast „Palce” pojawi się „Mysz”. Używaj paska trybów.
+    W statusie zamiast „Palce” pojawi się „Mysz”. Używaj stuknij-i-przeciągnij oraz joysticka.
   - **Gesty Studio – pinch** → jeśli Studio zgłasza własny gest szczypania, plugin używa go
     do zoomu, nawet gdy pojedyncze palce nie docierają.
 - Gdy sterowanie jest aktywne, plugin przejmuje mysz w widoku 3D – jak każde narzędzie Studio.
@@ -135,7 +137,7 @@ Przycisk działa bez ikony. Żeby ją dodać, wgraj [`assets/icon.png`](assets/i
 
 | Problem | Co zrobić |
 | --- | --- |
-| Działa tylko jeden palec, szczypanie nic nie robi | Studio podaje dotyk jako mysz (patrz Diagnostyka). Przesuwanie i zoom: pasek trybów z lewej |
+| Działa tylko jeden palec, szczypanie nic nie robi | Studio podaje dotyk jako mysz (patrz Diagnostyka). Zoom: stuknij i przeciągnij albo suwak; przesuwanie: joystick |
 | Kamera w ogóle nie reaguje | Upewnij się, że status to „Aktywny” i że **Mysz i rysik** jest włączone; sprawdź w Diagnostyce, czy rosną liczniki |
 | Status „Wstrzymany” | Wybrano inne narzędzie Studio – włącz ponownie przełącznikiem w oknie |
 | Zoom włącza się zamiast przesuwania (lub odwrotnie) | Na początku gestu przesuwaj palce wyraźniej albo włącz **Zoom i pan razem** |

@@ -75,9 +75,12 @@ local SelectionController = require(script.Parent.Selection.SelectionController)
 local Theme = require(script.Parent.UI.Theme)
 local Overlay = require(script.Parent.UI.Overlay)
 local Panel = require(script.Parent.UI.Panel)
-local ModeBar = require(script.Parent.UI.ModeBar)
+local Navigator = require(script.Parent.UI.Navigator)
 
 local STATS_REFRESH = 0.25 -- s between diagnostics updates
+-- A tap followed by a drag is a zoom, not a selection: undo the tap's selection
+-- if the drag starts within this time.
+local TAP_UNDO_WINDOW = 1
 
 local App = {}
 App.__index = App
@@ -96,7 +99,7 @@ function App.new(plugin: Plugin)
 	self._open = false
 	self._active = false
 	self._touchDetected = UserInputService.TouchEnabled
-	self._oneFingerMode = "rotate"
+	self._beforeTap = nil -- { selection, time } saved by the last tap
 	self._statsScheduled = false
 	self._mouseOnlyHintShown = false
 
@@ -112,7 +115,7 @@ function App.new(plugin: Plugin)
 	self.input = TouchInput.new(self.recognizer, {
 		isBlocked = function(position)
 			return (self.panel ~= nil and self.panel:ContainsPoint(position))
-				or (self.modeBar ~= nil and self.modeBar:ContainsPoint(position))
+				or (self.navigator ~= nil and self.navigator:ContainsPoint(position))
 		end,
 		mouseEnabled = function()
 			return self.settings:Get("mouseInput")
@@ -145,11 +148,9 @@ function App:Open()
 	end
 	self._open = true
 	self:_ensureGui()
-	-- Opening always shows the full window (it can be collapsed from there)
-	-- and starts in the default one-finger mode.
+	-- Opening always shows the full window; it can be collapsed from there.
 	self.panel:SetCollapsed(false, true)
 	self.panel:SetVisible(true)
-	self:_setOneFingerMode("rotate")
 	self:SetActive(true)
 	self.OpenChanged:Fire(true)
 end
@@ -180,9 +181,7 @@ function App:SetActive(active: boolean)
 		self._plugin:Activate(true)
 		self.input:Start()
 		self._heartbeat = RunService.Heartbeat:Connect(function(dt)
-			-- Both fingers have reported by now: apply this frame's two-finger movement.
-			self.recognizer:Flush()
-			self.camera:Step(dt)
+			self:_step(dt)
 		end)
 	else
 		self.input:Stop()
@@ -207,21 +206,34 @@ function App:SetActive(active: boolean)
 		self.panel:SetTouchCount(0)
 		self.panel:SetGesture(nil)
 	end
-	self:_refreshModeBar()
+	self:_refreshNavigator()
 end
 
-function App:_setOneFingerMode(mode: string)
-	self._oneFingerMode = mode
-	self.recognizer:SetOneFingerMode(mode)
-	if self.modeBar then
-		self.modeBar:SetMode(mode)
+-- Runs every frame while touch controls are active.
+function App:_step(dt: number)
+	-- Both fingers have reported by now: apply this frame's two-finger movement.
+	self.recognizer:Flush()
+
+	local navigator = self.navigator
+	if navigator then
+		navigator:Step()
+		local pan = navigator:GetPan()
+		if pan.Magnitude > 0 then
+			self.camera:Slide(pan, dt)
+		end
+		local zoom = navigator:GetZoom()
+		if zoom ~= 0 then
+			self.camera:RailZoom(zoom, dt)
+		end
 	end
+
+	self.camera:Step(dt)
 end
 
--- The mode bar is only useful while touch controls are running.
-function App:_refreshModeBar()
-	if self.modeBar then
-		self.modeBar:SetVisible(self._open and self._active and self.settings:Get("showModeBar"))
+-- The joystick is only useful while touch controls are running.
+function App:_refreshNavigator()
+	if self.navigator then
+		self.navigator:SetVisible(self._open and self._active and self.settings:Get("showNavigator"))
 	end
 end
 
@@ -267,19 +279,25 @@ function App:_ensureGui()
 
 	self.overlay = Overlay.new(gui, self.settings)
 	self:_createPanel()
-	self:_createModeBar()
+	self:_createNavigator()
 end
 
-function App:_createModeBar()
-	self.modeBar = ModeBar.new({
+function App:_createNavigator()
+	local navigator = Navigator.new({
 		parent = self.gui,
 		locale = self.locale,
-		mode = self._oneFingerMode,
-		onModeChanged = function(mode)
-			self:_setOneFingerMode(mode)
-		end,
 	})
-	self:_refreshModeBar()
+	-- Pan and zoom aim at whatever is in the middle of the screen.
+	local function anchorAtCenter()
+		local camera = Workspace.CurrentCamera
+		if camera then
+			self.camera:AnchorAt(camera.ViewportSize / 2)
+		end
+	end
+	navigator.PanBegan:Connect(anchorAtCenter)
+	navigator.ZoomBegan:Connect(anchorAtCenter)
+	self.navigator = navigator
+	self:_refreshNavigator()
 end
 
 function App:_createPanel()
@@ -313,16 +331,16 @@ function App:_rebuildPanel()
 	self:_createPanel()
 	self.panel:SetCollapsed(wasCollapsed, true)
 	self.panel:SetVisible(wasVisible, true)
-	if self.modeBar then
-		self.modeBar:Destroy()
-		self:_createModeBar()
+	if self.navigator then
+		self.navigator:Destroy()
+		self:_createNavigator()
 	end
 end
 
 function App:_destroyGui()
-	if self.modeBar then
-		self.modeBar:Destroy()
-		self.modeBar = nil
+	if self.navigator then
+		self.navigator:Destroy()
+		self.navigator = nil
 	end
 	if self.panel then
 		self.panel:Destroy()
@@ -410,6 +428,9 @@ function App:_bindGestures()
 	maid:Give(recognizer.LongPress:Connect(function(position)
 		self:_onLongPress(position)
 	end))
+	maid:Give(recognizer.TapDragBegan:Connect(function()
+		self:_undoTapSelection()
+	end))
 
 	-- Status readouts.
 	maid:Give(recognizer.GestureChanged:Connect(function(gesture)
@@ -454,7 +475,7 @@ function App:_maybeExplainMouseOnly()
 		return
 	end
 	self._mouseOnlyHintShown = true
-	if self.overlay and self.settings:Get("showModeBar") then
+	if self.overlay then
 		self.overlay:Toast(self.locale:t("toastMouseOnly"), Theme.Color.Warning)
 	end
 end
@@ -471,17 +492,14 @@ function App:_bindSettings()
 			end)
 		elseif key == "showTouches" and not value and self.overlay then
 			self.overlay:ClearTouches()
-		elseif key == "showModeBar" then
-			if not value then
-				-- Without the bar there is no way back, so fall back to rotating.
-				self:_setOneFingerMode("rotate")
-			end
-			self:_refreshModeBar()
+		elseif key == "showNavigator" then
+			self:_refreshNavigator()
 		end
 	end))
 end
 
 function App:_onTap(position: Vector2)
+	self._beforeTap = { selection = self.selection:Get(), time = os.clock() }
 	local target = self.selection:SelectAt(position)
 	local overlay = self.overlay
 	if not overlay then
@@ -492,6 +510,18 @@ function App:_onTap(position: Vector2)
 		overlay:Toast(self.locale:t("toastSelected", target.Name), Theme.Color.Accent)
 	else
 		overlay:Toast(self.locale:t("toastCleared"), Theme.Color.TextDim)
+	end
+end
+
+-- The tap that started a tap-and-drag zoom should not have changed the selection.
+function App:_undoTapSelection()
+	local saved = self._beforeTap
+	self._beforeTap = nil
+	if saved and os.clock() - saved.time <= TAP_UNDO_WINDOW then
+		self.selection:Set(saved.selection)
+		if self.overlay then
+			self.overlay:HideToast()
+		end
 	end
 end
 
@@ -559,6 +589,11 @@ local FOCUS_AXIS_COS = math.cos(math.rad(3))
 local FOCUS_DURATION = 0.45
 local FOCUS_MARGIN = 1.15
 local MAX_FOCUS_PARTS = 5000
+
+-- Joystick and zoom slider (values at full deflection).
+local SLIDE_SPEED = 900 -- screen pixels per second at the depth of the anchor
+local RAIL_ZOOM_RATE = 1.8 -- 1/s: the distance shrinks e^1.8 (about 6x) per second
+local CONTROL_CURVE = 1.5 -- deflection exponent: small pushes stay precise
 
 local INERTIA_FRICTION = 7 -- 1/s; a flick at v px/s coasts another v / 7 px
 local INERTIA_START_SPEED = 80 -- px/s
@@ -638,6 +673,7 @@ function CameraController.new(settings)
 	local self = setmetatable({}, CameraController)
 	self._settings = settings
 	self._pivot = nil :: Vector3?
+	self._focusDepth = nil :: number? -- "look" mode: how far ahead Studio's focus sits
 	self._lastCFrame = nil :: CFrame?
 	self._anchor = nil :: Vector3?
 	self._inertia = nil
@@ -654,13 +690,22 @@ function CameraController:_isOurs(camera: Camera): boolean
 	return self._lastCFrame ~= nil and sameCFrame(camera.CFrame, self._lastCFrame)
 end
 
+-- Studio's edit camera keeps aiming at Camera.Focus: a focus point that is not
+-- straight ahead makes Studio turn the camera back toward it. So Focus always
+-- moves along with the camera, on its line of sight.
 function CameraController:_apply(camera: Camera, cframe: CFrame, pivot: Vector3)
+	local depth
+	if self._settings:Get("rotateMode") == "look" then
+		depth = self._focusDepth or DEFAULT_PIVOT_DISTANCE
+	else
+		depth = (pivot - cframe.Position):Dot(cframe.LookVector)
+	end
+	depth = math.clamp(depth, MIN_ORBIT_DISTANCE, MAX_ZOOM_DISTANCE)
+
+	camera.Focus = CFrame.new(cframe.Position + cframe.LookVector * depth)
 	camera.CFrame = cframe
 	self._pivot = pivot
 	self._lastCFrame = camera.CFrame
-	if self._settings:Get("rotateMode") == "orbit" then
-		camera.Focus = CFrame.new(pivot)
-	end
 end
 
 function CameraController:_resolvePivot(camera: Camera): Vector3
@@ -689,6 +734,14 @@ end
 
 function CameraController:_getPivot(camera: Camera): Vector3
 	if self._settings:Get("rotateMode") == "look" then
+		-- Turning in place: remember how far ahead Studio's focus was, to keep it there.
+		if self._focusDepth == nil or not self:_isOurs(camera) then
+			local cframe = camera.CFrame
+			local depth = (camera.Focus.Position - cframe.Position):Dot(cframe.LookVector)
+			self._focusDepth = if depth > MIN_ORBIT_DISTANCE and depth < MAX_ZOOM_DISTANCE
+				then depth
+				else DEFAULT_PIVOT_DISTANCE
+		end
 		return camera.CFrame.Position
 	end
 	if self._pivot and self:_isOurs(camera) then
@@ -837,6 +890,36 @@ function CameraController:Zoom(scale: number, centroid: Vector2)
 	end
 
 	self:_apply(camera, cframe + offset, newPivot)
+end
+
+-- Joystick: moves the camera across the screen plane. `direction` is in screen
+-- space (X right, Y down), up to length 1; the camera flies the way it points.
+function CameraController:Slide(direction: Vector2, dt: number)
+	local camera = self:_camera()
+	local amount = math.min(direction.Magnitude, 1)
+	if not camera or amount < 1e-3 then
+		return
+	end
+
+	local cframe = camera.CFrame
+	local pivot = self:_getPivot(camera)
+	local anchor = self._anchor or pivot
+	local depth = math.max((anchor - cframe.Position):Dot(cframe.LookVector), MIN_PAN_DEPTH)
+	local studsPerPixel = 2 * depth * math.tan(math.rad(camera.FieldOfView) / 2) / math.max(camera.ViewportSize.Y, 1)
+
+	local pixels = direction.Unit * (amount ^ CONTROL_CURVE) * SLIDE_SPEED * dt * self._settings:Get("panSensitivity")
+	local offset = (cframe.RightVector * pixels.X - cframe.UpVector * pixels.Y) * studsPerPixel
+	self:_apply(camera, cframe + offset, pivot + offset)
+end
+
+-- Zoom slider: `amount` in [-1, 1], positive moves toward the middle of the screen.
+function CameraController:RailZoom(amount: number, dt: number)
+	local camera = self:_camera()
+	if not camera or amount == 0 then
+		return
+	end
+	local curved = math.sign(amount) * math.abs(math.clamp(amount, -1, 1)) ^ CONTROL_CURVE
+	self:Zoom(math.exp(-RAIL_ZOOM_RATE * curved * dt), camera.ViewportSize / 2)
 end
 
 function CameraController:StartInertia(kind: "rotate" | "pan", velocity: Vector2)
@@ -995,7 +1078,7 @@ return Raycast
 			<Properties>
 				<string name="Name">Config</string>
 				<ProtectedString name="Source"><![CDATA[return {
-	Version = "1.1.0",
+	Version = "1.2.0",
 	ToolbarName = "Touch Peak",
 	ButtonId = "TouchPeakToggle",
 	ButtonText = "Touch Peak",
@@ -1016,21 +1099,20 @@ return Raycast
 					<ProtectedString name="Source"><![CDATA[--[[
 	Turns raw touch points into high level gestures.
 
-	  1 finger drag ............ depends on the one-finger mode:
-	                               "rotate" -> Rotate(delta)      -> RotateEnded(velocity)
-	                               "pan"    -> Pan(delta)         -> PanEnded(velocity)
-	                               "zoom"   -> Zoom(scale)  (drag up = closer)
+	  1 finger drag ............ Rotate(delta)         -> RotateEnded(velocity)
+	  tap, then drag ........... TapDragBegan(position), Zoom(scale)  (drag up = closer)
 	  2 fingers, apart/together  Zoom(scale, centroid)
-	  2 fingers, same direction  Pan(delta, centroid) -> PanEnded(velocity)
+	  2 fingers, same direction  Pan(delta, centroid)  -> PanEnded(velocity)
 	  quick tap ................ Tap(position)
 	  second quick tap ......... DoubleTap(position)
 	  press and hold ........... LongPress(position)
 
 	AnchorBegan(position) fires when a pan or zoom starts, with the screen
-	point the camera should zoom toward / keep under the finger.
+	point the camera should zoom toward / keep under the fingers.
 
 	Roblox Studio on Windows usually reports a touch screen as a single mouse
-	pointer, so every two-finger action also has a one-finger mode.
+	pointer, which is why zoom also works with one finger ("tap, then drag",
+	like one-handed zoom in map apps).
 
 	Touches are identified by any key (Roblox reuses the same InputObject for
 	the whole life of a finger), so the recognizer does not depend on Studio
@@ -1051,23 +1133,21 @@ local Signal = require(script.Parent.Parent.Util.Signal)
 
 local DEFAULT_CONFIG = {
 	tapSlop = 10, -- px a finger may drift and still count as a tap
-	doubleTapTime = 0.35, -- s between two taps
+	doubleTapTime = 0.32, -- s from lifting the finger to touching again
 	doubleTapSlop = 40, -- px between two taps
 	longPressTime = 0.6, -- s
 	twoFingerLockDistance = 10, -- px before deciding between zoom and pan
-	dragZoomRate = 1 / 220, -- one-finger zoom: dragging this many px changes distance e times
+	dragZoomRate = 1 / 220, -- tap-and-drag zoom: 220 px changes the distance e times
 	velocityWindow = 0.1, -- s of movement used for the release velocity
 	releaseStaleTime = 0.08, -- s without movement before release cancels inertia
 	maxReleaseSpeed = 2500, -- px/s
 	maxBatchDelay = 0.05, -- s two-finger movement may wait for Flush()
 }
 
-export type OneFingerMode = "rotate" | "pan" | "zoom"
-
 -- idle        nothing touching
 -- pending     one finger down, could still become a tap, a drag or a long press
 -- held        long press fired; moving now still starts a drag
--- drag        one finger dragging (see _dragKind)
+-- drag        one finger dragging: rotating, or zooming after a tap (see _dragKind)
 -- twoPending  two fingers down, not yet clear whether zoom or pan
 -- twoZoom / twoPan / twoBoth
 -- blocked     a two-finger gesture ended but a finger is still down
@@ -1102,8 +1182,7 @@ function GestureRecognizer.new(options: Options?)
 	end
 
 	self._combine = false
-	self._oneFingerMode = "rotate" :: OneFingerMode
-	self._dragKind = "rotate" :: OneFingerMode
+	self._dragKind = "rotate" :: "rotate" | "zoom"
 	self._mode = "idle" :: Mode
 	self._gesture = nil :: string?
 	self._touches = {} -- id -> record
@@ -1124,6 +1203,7 @@ function GestureRecognizer.new(options: Options?)
 	self.TouchCountChanged = Signal.new()
 	self.GestureChanged = Signal.new()
 	self.AnchorBegan = Signal.new()
+	self.TapDragBegan = Signal.new()
 	self.Rotate = Signal.new()
 	self.RotateEnded = Signal.new()
 	self.Pan = Signal.new()
@@ -1138,15 +1218,6 @@ end
 
 function GestureRecognizer:SetCombine(combine: boolean)
 	self._combine = combine
-end
-
--- What a one-finger drag does. Takes effect from the next drag.
-function GestureRecognizer:SetOneFingerMode(mode: OneFingerMode)
-	self._oneFingerMode = mode
-end
-
-function GestureRecognizer:GetOneFingerMode(): OneFingerMode
-	return self._oneFingerMode
 end
 
 function GestureRecognizer:GetMode(): Mode
@@ -1184,12 +1255,19 @@ function GestureRecognizer:TouchBegan(id: any, position: Vector2, slop: number?)
 		return
 	end
 
+	local now = self._clock()
+	local config = self._config
+	local last = self._lastTap
 	local record = {
 		id = id,
 		start = position,
 		position = position,
-		startTime = self._clock(),
-		slop = slop or self._config.tapSlop,
+		startTime = now,
+		slop = slop or config.tapSlop,
+		-- Touching again right where a tap just ended: a double tap, or a tap-and-drag zoom.
+		afterTap = last ~= nil
+			and now - last.time <= config.doubleTapTime
+			and (position - last.position).Magnitude <= config.doubleTapSlop,
 	}
 	self._touches[id] = record
 	table.insert(self._order, id)
@@ -1198,7 +1276,10 @@ function GestureRecognizer:TouchBegan(id: any, position: Vector2, slop: number?)
 		self._mode = "pending"
 		self._samples = {}
 		self.InteractionBegan:Fire()
-		self:_scheduleLongPress(record)
+		-- After a tap, a pause before dragging must not turn into a long press.
+		if not record.afterTap then
+			self:_scheduleLongPress(record)
+		end
 	else
 		-- A second finger turns whatever the first one was doing into a two-finger gesture.
 		self:_cancelLongPress()
@@ -1296,8 +1377,6 @@ function GestureRecognizer:TouchEnded(id: any, position: Vector2?)
 		self:_setGesture(nil)
 		if self._dragKind == "rotate" then
 			self.RotateEnded:Fire(self:_releaseVelocity(now))
-		elseif self._dragKind == "pan" then
-			self.PanEnded:Fire(self:_releaseVelocity(now))
 		end
 	elseif isTwoFinger(mode) then
 		self._mode = "blocked"
@@ -1331,25 +1410,22 @@ function GestureRecognizer:_pair()
 end
 
 function GestureRecognizer:_beginDrag(record)
-	local kind = self._oneFingerMode
+	local kind = if record.afterTap then "zoom" else "rotate"
 	self._mode = "drag"
 	self._dragKind = kind
 	self._samples = {}
 	self._lastTap = nil
 	self:_setGesture(kind)
-	if kind ~= "rotate" then
+	if kind == "zoom" then
+		self.TapDragBegan:Fire(record.start)
 		self.AnchorBegan:Fire(record.start)
 	end
 end
 
 function GestureRecognizer:_emitDrag(record, delta: Vector2, now: number)
-	local kind = self._dragKind
-	if kind == "rotate" then
+	if self._dragKind == "rotate" then
 		self:_addSample(now, delta)
 		self.Rotate:Fire(delta)
-	elseif kind == "pan" then
-		self:_addSample(now, delta)
-		self.Pan:Fire(delta, record.position)
 	elseif delta.Y ~= 0 then
 		-- Dragging up (negative Y) moves closer, like pushing the view forward.
 		self.Zoom:Fire(math.exp(delta.Y * self._config.dragZoomRate), record.start)
@@ -1403,20 +1479,12 @@ function GestureRecognizer:_updateTwoFinger(now: number)
 end
 
 function GestureRecognizer:_handleTap(record, now: number)
-	local position = record.position
-	local last = self._lastTap
-	local config = self._config
-
-	if
-		last
-		and now - last.time <= config.doubleTapTime
-		and (position - last.position).Magnitude <= config.doubleTapSlop
-	then
+	if record.afterTap then
 		self._lastTap = nil
-		self.DoubleTap:Fire(position)
+		self.DoubleTap:Fire(record.position)
 	else
-		self._lastTap = { time = now, position = position }
-		self.Tap:Fire(position)
+		self._lastTap = { time = now, position = record.position }
+		self.Tap:Fire(record.position)
 	end
 end
 
@@ -1872,27 +1940,25 @@ local STRINGS = {
 
 		gestureRotate = "Obrót kamery",
 		gestureRotateHint = "Przesuń jednym palcem",
-		gestureZoom = "Przybliżanie",
-		gestureZoomHint = "Rozsuń lub zsuń dwa palce",
-		gesturePan = "Przesuwanie (Pan)",
-		gesturePanHint = "Przesuń dwa palce w tę samą stronę",
+		gestureTapDrag = "Przybliżanie jednym palcem",
+		gestureTapDragHint = "Stuknij, potem przeciągnij w górę lub w dół",
+		gestureJoystick = "Joystick i suwak",
+		gestureJoystickHint = "Lewy dolny róg: lot kamery i zoom",
+		gestureTwoFingers = "Dwa palce",
+		gestureTwoFingersHint = "Rozsuń: zoom · razem: przesuwanie",
 		gestureTap = "Zaznacz obiekt",
 		gestureTapHint = "Stuknij obiekt – pusty obszar odznacza",
 		gestureDoubleTap = "Skup kamerę",
 		gestureDoubleTapHint = "Stuknij dwukrotnie obiekt",
 		gestureLongPress = "Dodaj / usuń z zaznaczenia",
 		gestureLongPressHint = "Przytrzymaj palec na obiekcie",
-		gestureModes = "Pasek trybów (1 palec)",
-		gestureModesHint = "Z lewej: obrót, przesuwanie albo zoom",
-
-		modeRotate = "Obrót",
-		modePan = "Przesuń",
-		modeZoom = "Zoom",
 
 		hudRotate = "Obrót",
 		hudZoom = "Przybliżanie",
 		hudPan = "Przesuwanie",
 		hudBoth = "Zoom + pan",
+		navPan = "Przesuń",
+		navZoom = "Zoom",
 
 		toastSelected = "Zaznaczono: %s",
 		toastAdded = "Dodano: %s",
@@ -1903,7 +1969,7 @@ local STRINGS = {
 		toastPausedByTool = "Wstrzymano – wybrano inne narzędzie",
 		toastResumed = "Sterowanie dotykiem włączone",
 		toastSelectionItems = "%d obiektów",
-		toastMouseOnly = "Studio podaje dotyk jako mysz – przesuwanie i zoom na pasku z lewej",
+		toastMouseOnly = "Studio podaje dotyk jako mysz – zoom: stuknij i przeciągnij, przesuwanie: joystick",
 
 		sectionSensitivity = "CZUŁOŚĆ",
 		rotateSpeed = "Obrót",
@@ -1930,8 +1996,8 @@ local STRINGS = {
 		showTouchesHint = "Kółka pod palcami",
 		mouseInput = "Mysz i rysik",
 		mouseInputHint = "Lewy przycisk działa jak palec",
-		showModeBar = "Pasek trybów",
-		showModeBarHint = "Przesuwanie i zoom jednym palcem",
+		showNavigator = "Joystick i suwak zoomu",
+		showNavigatorHint = "W lewym dolnym rogu widoku",
 		language = "Język",
 		languageAuto = "Auto",
 
@@ -1966,27 +2032,25 @@ local STRINGS = {
 
 		gestureRotate = "Rotate camera",
 		gestureRotateHint = "Drag with one finger",
-		gestureZoom = "Zoom",
-		gestureZoomHint = "Pinch two fingers in or out",
-		gesturePan = "Pan",
-		gesturePanHint = "Drag two fingers the same way",
+		gestureTapDrag = "One-finger zoom",
+		gestureTapDragHint = "Tap, then drag up or down",
+		gestureJoystick = "Joystick and slider",
+		gestureJoystickHint = "Bottom-left: fly the camera and zoom",
+		gestureTwoFingers = "Two fingers",
+		gestureTwoFingersHint = "Spread: zoom · together: pan",
 		gestureTap = "Select object",
 		gestureTapHint = "Tap an object – empty space clears",
 		gestureDoubleTap = "Focus camera",
 		gestureDoubleTapHint = "Double-tap an object",
 		gestureLongPress = "Add / remove from selection",
 		gestureLongPressHint = "Press and hold on an object",
-		gestureModes = "Mode bar (1 finger)",
-		gestureModesHint = "On the left: rotate, pan or zoom",
-
-		modeRotate = "Rotate",
-		modePan = "Pan",
-		modeZoom = "Zoom",
 
 		hudRotate = "Rotate",
 		hudZoom = "Zoom",
 		hudPan = "Pan",
 		hudBoth = "Zoom + pan",
+		navPan = "Pan",
+		navZoom = "Zoom",
 
 		toastSelected = "Selected: %s",
 		toastAdded = "Added: %s",
@@ -1997,7 +2061,7 @@ local STRINGS = {
 		toastPausedByTool = "Paused – another tool was selected",
 		toastResumed = "Touch controls on",
 		toastSelectionItems = "%d objects",
-		toastMouseOnly = "Studio sends touch as a mouse – pan and zoom on the left bar",
+		toastMouseOnly = "Studio sends touch as a mouse – zoom: tap and drag, pan: joystick",
 
 		sectionSensitivity = "SENSITIVITY",
 		rotateSpeed = "Rotate",
@@ -2024,8 +2088,8 @@ local STRINGS = {
 		showTouchesHint = "Circles under your fingers",
 		mouseInput = "Mouse & pen",
 		mouseInputHint = "Left button acts as a finger",
-		showModeBar = "Mode bar",
-		showModeBarHint = "Pan and zoom with one finger",
+		showNavigator = "Joystick and zoom slider",
+		showNavigatorHint = "Bottom-left corner of the view",
 		language = "Language",
 		languageAuto = "Auto",
 
@@ -2198,6 +2262,10 @@ function SelectionController:Get(): { Instance }
 	return Selection:Get()
 end
 
+function SelectionController:Set(instances: { Instance })
+	Selection:Set(instances)
+end
+
 return SelectionController
 ]]></ProtectedString>
 				</Properties>
@@ -2229,7 +2297,7 @@ local DEFAULTS = {
 	selectModels = true,
 	showTouches = true,
 	mouseInput = true,
-	showModeBar = true,
+	showNavigator = true,
 	language = "auto", -- "auto" | "pl" | "en"
 }
 
@@ -3085,29 +3153,43 @@ function Icons.longPress()
 	return icon, tweens
 end
 
--- A tiny mode bar whose highlight steps between its three buttons.
-function Icons.modes()
+-- A tap mark, then the finger sliding up from it.
+function Icons.tapDrag()
 	local icon = canvas()
+	local mark = Create.ring(14, Color.Accent, 0.35, 1.5, UDim2.fromScale(0.5, 0.74))
+	mark.Parent = icon
 	Create("Frame", {
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromOffset(14, 30),
-		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.fromScale(0.5, 0.74),
+		Size = UDim2.new(0, 2, 0.48, 0),
+		BackgroundColor3 = Color.White,
+		BackgroundTransparency = 0.8,
 		Parent = icon,
-	}, {
-		Create.corner(7),
-		Create.stroke(Color.White, 0.7, 1.5),
 	})
-	for _, y in { 0.27, 0.5, 0.73 } do
-		local dot = Create.dot(4, Color.White, UDim2.fromScale(0.5, y))
-		dot.BackgroundTransparency = 0.6
-		dot.Parent = icon
-	end
-	local highlight = Create.dot(8, Color.Accent, UDim2.fromScale(0.5, 0.27))
-	highlight.Parent = icon
+	local dot = finger(UDim2.fromScale(0.5, 0.74))
+	dot.Parent = icon
 
 	local tweens = {
-		loop(highlight, 1.4, { Position = UDim2.fromScale(0.5, 0.73) }, Enum.EasingStyle.Quint, true),
+		loop(dot, 0.9, { Position = UDim2.fromScale(0.5, 0.26) }, Enum.EasingStyle.Quad, true),
+	}
+	return icon, tweens
+end
+
+-- A joystick knob circling inside its base.
+function Icons.joystick()
+	local icon = canvas()
+	Create.ring(28, Color.White, 0.65, 1.5).Parent = icon
+	local spinner = Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Parent = icon,
+	})
+	Create.dot(12, Color.Accent, UDim2.new(0.5, 0, 0.5, -6)).Parent = spinner
+
+	local tweens = {
+		loop(spinner, 2.2, { Rotation = 360 }, Enum.EasingStyle.Linear),
 	}
 	return icon, tweens
 end
@@ -3118,240 +3200,374 @@ return Icons
 			</Item>
 			<Item class="ModuleScript" referent="RBX17">
 				<Properties>
-					<string name="Name">ModeBar</string>
+					<string name="Name">Navigator</string>
 					<ProtectedString name="Source"><![CDATA[--[[
-	A vertical bar on the left edge of the viewport that picks what a
-	one-finger drag does: rotate, pan or zoom.
+	On-screen camera controls in the bottom-left corner of the viewport:
 
-	Studio usually reports a touch screen as a single mouse pointer, so this
-	is how pan and zoom stay possible with one finger (or a pen / mouse).
+	  * a joystick: push it and the camera flies that way across the screen,
+	    faster the further it is pushed (pan),
+	  * a zoom slider next to it: push up to move in, down to move out.
+
+	Both spring back when released. They work with a single pointer, which
+	matters because Studio usually reports a touch screen as one mouse, and
+	with real multi-touch the joystick can be held while the other hand
+	rotates the camera.
 ]]
+
+local UserInputService = game:GetService("UserInputService")
 
 local Theme = require(script.Parent.Theme)
 local Create = require(script.Parent.Create)
+local Components = require(script.Parent.Components)
 local Maid = require(script.Parent.Parent.Util.Maid)
+local Signal = require(script.Parent.Parent.Util.Signal)
 
 local Color = Theme.Color
 local Font = Theme.Font
 
-local BUTTON_HEIGHT = 56
-local PADDING = 7
-local GAP = 6
-local WIDTH = 66
+local BASE = 136 -- joystick diameter
+local KNOB = 56
+local RAIL_WIDTH = 56
+local RAIL_KNOB = 44
+local GAP = 14
+local LABEL_HEIGHT = 20
+local DEAD_ZONE = 0.08
 
-local MODES = { "rotate", "pan", "zoom" }
-local LABELS = { rotate = "modeRotate", pan = "modePan", zoom = "modeZoom" }
+local STICK_RADIUS = (BASE - KNOB) / 2
+local RAIL_TRAVEL = (BASE - RAIL_KNOB) / 2
 
-local function bar(width: number, height: number, position: UDim2, rotation: number?): Frame
+local function toVector2(position: Vector3): Vector2
+	return Vector2.new(position.X, position.Y)
+end
+
+local function isPointer(input: InputObject): boolean
+	local inputType = input.UserInputType
+	return inputType == Enum.UserInputType.MouseButton1 or inputType == Enum.UserInputType.Touch
+end
+
+-- Glassy rounded surface shared by the joystick base and the slider.
+local function surface(size: UDim2, position: UDim2): Frame
+	return Create("Frame", {
+		Position = position,
+		Size = size,
+		BackgroundColor3 = Color.Background,
+		BackgroundTransparency = 0.22,
+		ZIndex = 2,
+	}, {
+		Create.round(),
+		Stroke = Create.stroke(Color.White, 0.84, 1.5),
+	})
+end
+
+-- A gradient knob with a soft shadow, wrapped in a holder that moves as one.
+local function knob(size: number): (Frame, UIScale)
+	local scale = Create("UIScale", { Scale = 1 })
+	local holder = Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(size, size),
+		BackgroundTransparency = 1,
+		ZIndex = 3,
+	}, {
+		Scale = scale,
+		Shadow = Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, 0, 0.5, 3),
+			Size = UDim2.new(1, 8, 1, 8),
+			BackgroundColor3 = Color.Black,
+			BackgroundTransparency = 0.75,
+			ZIndex = 3,
+		}, { Create.round() }),
+		Knob = Create("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = Color.White,
+			ZIndex = 4,
+		}, {
+			Create.round(),
+			Create.accentGradient(45),
+			Create.stroke(Color.White, 0.5, 2),
+			Dot = Create.dot(10, Color.White),
+		}),
+	})
+	holder.Knob.Dot.ZIndex = 5
+	holder.Name = "Knob"
+	return holder, scale
+end
+
+local function hint(glyph: GuiObject, position: UDim2, rotation: number?): GuiObject
+	glyph.Position = position
+	glyph.Rotation = rotation or 0
+	glyph.ZIndex = 3
+	for _, part in glyph:GetDescendants() do
+		if part:IsA("Frame") then
+			part.BackgroundTransparency = 0.45
+			part.ZIndex = 3
+		end
+	end
+	return glyph
+end
+
+local function plusMinus(plus: boolean, position: UDim2): Frame
+	local bar = function(width: number, height: number)
+		return Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(width, height),
+			BackgroundColor3 = Color.Text,
+			BackgroundTransparency = 0.45,
+			ZIndex = 3,
+		}, { Create.round() })
+	end
 	return Create("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Position = position,
-		Size = UDim2.fromOffset(width, height),
-		Rotation = rotation or 0,
-		BackgroundColor3 = Color.TextDim,
-	}, { Create.round() })
+		Size = UDim2.fromOffset(14, 14),
+		BackgroundTransparency = 1,
+		ZIndex = 3,
+	}, {
+		H = bar(12, 2),
+		V = if plus then bar(2, 12) else nil,
+	})
 end
 
-local function center(dx: number, dy: number): UDim2
-	return UDim2.new(0.5, dx, 0.5, dy)
+local function caption(text: string, position: UDim2, width: number): TextLabel
+	return Create("TextLabel", {
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = position,
+		Size = UDim2.fromOffset(width, LABEL_HEIGHT),
+		Text = text,
+		FontFace = Font.Bold,
+		TextSize = 11,
+		TextColor3 = Color.Text,
+		TextTransparency = 0.25,
+		TextStrokeTransparency = 0.55,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		ZIndex = 2,
+	})
 end
 
--- Icons are drawn with frames so they can be recoloured by `tint`.
-local ICONS = {
-	rotate = function(icon)
-		Create.ring(18, Color.TextDim, 0, 2).Parent = icon
-		bar(6, 6, center(0, -9)).Parent = icon
-	end,
-	pan = function(icon)
-		bar(18, 2, center(0, 0)).Parent = icon
-		bar(2, 18, center(0, 0)).Parent = icon
-		for _, offset in { Vector2.new(0, -9), Vector2.new(0, 9), Vector2.new(-9, 0), Vector2.new(9, 0) } do
-			bar(5, 5, center(offset.X, offset.Y)).Parent = icon
-		end
-	end,
-	zoom = function(icon)
-		Create.ring(14, Color.TextDim, 0, 2, center(-2, -2)).Parent = icon
-		bar(6, 2, center(-2, -2)).Parent = icon
-		bar(2, 6, center(-2, -2)).Parent = icon
-		bar(7, 3, center(6, 6), 45).Parent = icon
-	end,
-}
-
-local function tint(icon: Instance, color: Color3)
-	for _, descendant in icon:GetDescendants() do
-		if descendant:IsA("UIStroke") then
-			descendant.Color = color
-		elseif descendant:IsA("Frame") and descendant.BackgroundTransparency < 1 then
-			descendant.BackgroundColor3 = color
-		end
-	end
-end
-
-local ModeBar = {}
-ModeBar.__index = ModeBar
-
-ModeBar.Modes = MODES
+local Navigator = {}
+Navigator.__index = Navigator
 
 export type Params = {
 	parent: GuiBase2d,
 	locale: any,
-	mode: string,
-	onModeChanged: (string) -> (),
 }
 
-function ModeBar.new(params: Params)
-	local self = setmetatable({}, ModeBar)
-	self._params = params
+function Navigator.new(params: Params)
+	local self = setmetatable({}, Navigator)
 	self._maid = Maid.new()
-	self._buttons = {}
-	self._mode = params.mode
+	self._tracking = {} -- "stick" | "rail" -> { input, isTouch }
+	self._springs = {} -- "stick" | "rail" -> the tween returning a knob to the middle
+	self._pan = Vector2.zero
+	self._zoom = 0
 
-	local height = PADDING * 2 + BUTTON_HEIGHT * #MODES + GAP * (#MODES - 1)
+	self.PanBegan = Signal.new()
+	self.ZoomBegan = Signal.new()
 
-	local body = Create("Frame", {
-		Size = UDim2.fromScale(1, 1),
-		BackgroundColor3 = Color.Background,
-		BackgroundTransparency = 0.03,
-		ZIndex = 2,
-	}, {
-		Create.corner(20),
-		Create.stroke(Color.White, 0.87),
-		Create.padding(PADDING),
-		Create.list(GAP),
-	})
+	local stick = surface(UDim2.fromOffset(BASE, BASE), UDim2.fromOffset(0, 0))
+	stick.Name = "Stick"
+	Create.ring(BASE - 44, Color.White, 0.88, 1).Parent = stick
+	hint(Components.ChevronGlyph(), UDim2.new(0.5, 0, 0, 15)).Parent = stick
+	hint(Components.ChevronGlyph(), UDim2.new(1, -15, 0.5, 0), 90).Parent = stick
+	hint(Components.ChevronGlyph(), UDim2.new(0.5, 0, 1, -15), 180).Parent = stick
+	hint(Components.ChevronGlyph(), UDim2.new(0, 15, 0.5, 0), -90).Parent = stick
+	local stickKnob, stickScale = knob(KNOB)
+	stickKnob.Parent = stick
+
+	local rail = surface(UDim2.fromOffset(RAIL_WIDTH, BASE), UDim2.fromOffset(BASE + GAP, 0))
+	rail.Name = "Rail"
+	plusMinus(true, UDim2.new(0.5, 0, 0, 16)).Parent = rail
+	plusMinus(false, UDim2.new(0.5, 0, 1, -16)).Parent = rail
+	local railKnob, railScale = knob(RAIL_KNOB)
+	railKnob.Parent = rail
 
 	local root = Create("Frame", {
-		Name = "TouchPeakModeBar",
-		AnchorPoint = Vector2.new(0, 0.5),
-		Position = UDim2.new(0, 14, 0.5, 0),
-		Size = UDim2.fromOffset(WIDTH, height),
+		Name = "TouchPeakNavigator",
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.new(0, 22, 1, -18),
+		Size = UDim2.fromOffset(BASE + GAP + RAIL_WIDTH, BASE + LABEL_HEIGHT),
 		BackgroundTransparency = 1,
 		Visible = false,
 		ZIndex = 9,
 	}, {
-		Body = body,
+		Stick = stick,
+		Rail = rail,
+		PanLabel = caption(params.locale:t("navPan"), UDim2.new(0, BASE / 2, 0, BASE + 2), BASE),
+		ZoomLabel = caption(
+			params.locale:t("navZoom"),
+			UDim2.new(0, BASE + GAP + RAIL_WIDTH / 2, 0, BASE + 2),
+			RAIL_WIDTH + GAP
+		),
 	})
 
-	for index, layer in { { 4, 0.9 }, { 12, 0.95 } } do
-		local spread, transparency = layer[1], layer[2]
-		Create("Frame", {
-			AnchorPoint = Vector2.new(0.5, 0.5),
-			Position = UDim2.new(0.5, 0, 0.5, 2 + index),
-			Size = UDim2.new(1, spread, 1, spread),
-			BackgroundColor3 = Color.Black,
-			BackgroundTransparency = transparency,
-			ZIndex = 1,
-			Parent = root,
-		}, { Create.corner(20 + spread / 2) })
-	end
+	self._root = root
+	self._stick = stick
+	self._rail = rail
+	self._knobs = { stick = stickKnob, rail = railKnob }
+	self._scales = { stick = stickScale, rail = railScale }
+	self._surfaces = { stick = stick, rail = rail }
 
-	for index, mode in MODES do
-		local icon = Create("Frame", {
-			AnchorPoint = Vector2.new(0.5, 0),
-			Position = UDim2.new(0.5, 0, 0, 9),
-			Size = UDim2.fromOffset(24, 24),
-			BackgroundTransparency = 1,
-			ZIndex = 2,
-		})
-		ICONS[mode](icon)
+	self:_bind("stick", stick)
+	self:_bind("rail", rail)
 
-		local fill = Create("Frame", {
-			Size = UDim2.fromScale(1, 1),
-			BackgroundColor3 = Color.White,
-			BackgroundTransparency = 1,
-		}, {
-			Create.corner(14),
-			Create.accentGradient(90),
-		})
-
-		local label = Create("TextLabel", {
-			AnchorPoint = Vector2.new(0, 1),
-			Position = UDim2.new(0, 0, 1, -6),
-			Size = UDim2.new(1, 0, 0, 12),
-			Text = params.locale:t(LABELS[mode]),
-			FontFace = Font.Bold,
-			TextSize = 11,
-			TextColor3 = Color.TextDim,
-			TextXAlignment = Enum.TextXAlignment.Center,
-			TextTruncate = Enum.TextTruncate.AtEnd,
-			ZIndex = 2,
-		})
-
-		local button = Create("TextButton", {
-			Name = mode,
-			Size = UDim2.new(1, 0, 0, BUTTON_HEIGHT),
-			LayoutOrder = index,
-		}, {
-			Fill = fill,
-			Icon = icon,
-			Label = label,
-		})
-		button.Parent = body
-
-		self._maid:Give(button.Activated:Connect(function()
-			if self._mode ~= mode then
-				self:SetMode(mode)
-				params.onModeChanged(mode)
+	self._maid:Give(UserInputService.InputChanged:Connect(function(input)
+		for kind, track in self._tracking do
+			if
+				(track.isTouch and input == track.input)
+				or (not track.isTouch and input.UserInputType == Enum.UserInputType.MouseMovement)
+			then
+				self:_move(kind, toVector2(input.Position))
 			end
-		end))
-
-		self._buttons[mode] = { button = button, fill = fill, icon = icon, label = label }
-	end
+		end
+	end))
+	self._maid:Give(UserInputService.InputEnded:Connect(function(input)
+		for kind, track in self._tracking do
+			if
+				(track.isTouch and input == track.input)
+				or (not track.isTouch and input.UserInputType == Enum.UserInputType.MouseButton1)
+			then
+				self:_release(kind)
+			end
+		end
+	end))
 
 	root.Parent = params.parent
 	self._maid:Give(root)
-	self._root = root
-	self._body = body
-
-	self:SetMode(params.mode, true)
 	return self
 end
 
-function ModeBar:GetMode(): string
-	return self._mode
+function Navigator:_bind(kind: string, frame: GuiObject)
+	self._maid:Give(frame.InputBegan:Connect(function(input)
+		if not isPointer(input) or self._tracking[kind] then
+			return
+		end
+		local isTouch = input.UserInputType == Enum.UserInputType.Touch
+		if not isTouch then
+			-- A mouse is one pointer: it can only hold one control at a time.
+			for _, track in self._tracking do
+				if not track.isTouch then
+					return
+				end
+			end
+		end
+		self._tracking[kind] = { input = input, isTouch = isTouch }
+		local spring = self._springs[kind]
+		if spring then
+			spring:Cancel()
+		end
+		Create.tween(self._scales[kind], Theme.Tween.Fast, { Scale = 1.08 })
+		Create.tween(self._surfaces[kind].Stroke, Theme.Tween.Fast, { Transparency = 0.55 })
+		if kind == "stick" then
+			self.PanBegan:Fire()
+		else
+			self.ZoomBegan:Fire()
+		end
+		self:_move(kind, toVector2(input.Position))
+	end))
 end
 
-function ModeBar:SetMode(mode: string, instant: boolean?)
-	if not self._buttons[mode] then
+function Navigator:_move(kind: string, position: Vector2)
+	if kind == "stick" then
+		local center = self._stick.AbsolutePosition + self._stick.AbsoluteSize / 2
+		local offset = position - center
+		if offset.Magnitude > STICK_RADIUS then
+			offset = offset.Unit * STICK_RADIUS
+		end
+		self._knobs.stick.Position = UDim2.new(0.5, offset.X, 0.5, offset.Y)
+		local value = offset / STICK_RADIUS
+		self._pan = if value.Magnitude < DEAD_ZONE then Vector2.zero else value
+	else
+		local centerY = self._rail.AbsolutePosition.Y + self._rail.AbsoluteSize.Y / 2
+		local offset = math.clamp(position.Y - centerY, -RAIL_TRAVEL, RAIL_TRAVEL)
+		self._knobs.rail.Position = UDim2.new(0.5, 0, 0.5, offset)
+		local value = -offset / RAIL_TRAVEL
+		self._zoom = if math.abs(value) < DEAD_ZONE then 0 else value
+	end
+end
+
+function Navigator:_release(kind: string)
+	if not self._tracking[kind] then
 		return
 	end
-	self._mode = mode
-	local info = if instant then nil else Theme.Tween.Fast
-	for name, entry in self._buttons do
-		local selected = name == mode
-		Create.animate(entry.fill, info, { BackgroundTransparency = if selected then 0 else 1 })
-		Create.animate(entry.label, info, { TextColor3 = if selected then Color.White else Color.TextDim })
-		tint(entry.icon, if selected then Color.White else Color.TextDim)
+	self._tracking[kind] = nil
+	if kind == "stick" then
+		self._pan = Vector2.zero
+	else
+		self._zoom = 0
+	end
+	self._springs[kind] = Create.tween(self._knobs[kind], Theme.Tween.Spring, { Position = UDim2.fromScale(0.5, 0.5) })
+	Create.tween(self._scales[kind], Theme.Tween.Smooth, { Scale = 1 })
+	Create.tween(self._surfaces[kind].Stroke, Theme.Tween.Smooth, { Transparency = 0.84 })
+end
+
+-- Joystick deflection in screen space (X right, Y down), length 0..1.
+function Navigator:GetPan(): Vector2
+	return self._pan
+end
+
+-- Slider deflection: positive zooms in, negative zooms out.
+function Navigator:GetZoom(): number
+	return self._zoom
+end
+
+function Navigator:IsHeld(): boolean
+	return next(self._tracking) ~= nil
+end
+
+-- Call every frame: lets go of controls whose mouse release Studio never reported.
+function Navigator:Step()
+	for kind, track in self._tracking do
+		if not track.isTouch then
+			local ok, pressed = pcall(function()
+				return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+			end)
+			if ok and pressed == false then
+				self:_release(kind)
+			end
+		end
 	end
 end
 
-function ModeBar:SetVisible(visible: boolean)
+function Navigator:SetVisible(visible: boolean)
 	self._root.Visible = visible
+	if not visible then
+		for kind in self._tracking do
+			self:_release(kind)
+		end
+	end
 end
 
-function ModeBar:IsVisible(): boolean
+function Navigator:IsVisible(): boolean
 	return self._root.Visible
 end
 
--- True when a screen point lies on the bar (so it should not move the camera).
-function ModeBar:ContainsPoint(point: Vector2): boolean
+-- True when a screen point lies on the joystick or the slider.
+function Navigator:ContainsPoint(point: Vector2): boolean
 	if not self._root.Visible then
 		return false
 	end
-	local position = self._body.AbsolutePosition
-	local size = self._body.AbsoluteSize
-	local margin = 6
-	return point.X >= position.X - margin
-		and point.X <= position.X + size.X + margin
-		and point.Y >= position.Y - margin
-		and point.Y <= position.Y + size.Y + margin
+	local margin = 8
+	for _, frame in { self._stick, self._rail } do
+		local position, size = frame.AbsolutePosition, frame.AbsoluteSize
+		if
+			point.X >= position.X - margin
+			and point.X <= position.X + size.X + margin
+			and point.Y >= position.Y - margin
+			and point.Y <= position.Y + size.Y + margin
+		then
+			return true
+		end
+	end
+	return false
 end
 
-function ModeBar:Destroy()
+function Navigator:Destroy()
+	self._tracking = {}
 	self._maid:Clean()
 end
 
-return ModeBar
+return Navigator
 ]]></ProtectedString>
 				</Properties>
 			</Item>
@@ -3603,6 +3819,10 @@ function Overlay:Toast(text: string, color: Color3?)
 	self._toast.flash(text, color, TOAST_TIME)
 end
 
+function Overlay:HideToast()
+	self._toast.hide()
+end
+
 function Overlay:ClearTouches()
 	for id in table.clone(self._touches) do
 		self:TouchEnded(id)
@@ -3654,12 +3874,12 @@ local FOOTER_HEIGHT = 34
 
 local GESTURES = {
 	{ icon = "rotate", title = "gestureRotate", hint = "gestureRotateHint" },
-	{ icon = "zoom", title = "gestureZoom", hint = "gestureZoomHint" },
-	{ icon = "pan", title = "gesturePan", hint = "gesturePanHint" },
-	{ icon = "modes", title = "gestureModes", hint = "gestureModesHint" },
+	{ icon = "tapDrag", title = "gestureTapDrag", hint = "gestureTapDragHint" },
+	{ icon = "joystick", title = "gestureJoystick", hint = "gestureJoystickHint" },
 	{ icon = "tap", title = "gestureTap", hint = "gestureTapHint" },
 	{ icon = "doubleTap", title = "gestureDoubleTap", hint = "gestureDoubleTapHint" },
 	{ icon = "longPress", title = "gestureLongPress", hint = "gestureLongPressHint" },
+	{ icon = "zoom", title = "gestureTwoFingers", hint = "gestureTwoFingersHint" },
 }
 
 local function toVector2(position: Vector3): Vector2
@@ -4142,7 +4362,7 @@ function Panel:_buildSettingsPage()
 	toggle("selectModels", "selectModels", "selectModelsHint")
 	toggle("showTouches", "showTouches", "showTouchesHint")
 	toggle("mouseInput", "mouseInput", "mouseInputHint")
-	toggle("showModeBar", "showModeBar", "showModeBarHint")
+	toggle("showNavigator", "showNavigator", "showNavigatorHint")
 	choice("language", "language", {
 		{ id = "auto", label = self:_t("languageAuto") },
 		{ id = "pl", label = "PL" },

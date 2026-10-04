@@ -246,53 +246,110 @@ return function(t)
 			expect(h.app.recognizer:GetMode()).toBe("pending")
 		end)
 
-		it("pans and zooms with one finger from the mode bar", function()
+		it("flies the camera with the joystick", function()
 			local h = setup()
 			h.app:Open()
-			local bar = h.world.coreGui.TouchPeak.TouchPeakModeBar
-			expect(bar.Visible).toBe(true)
+			local stick = h.world.coreGui.TouchPeak.TouchPeakNavigator.Stick
+			expect(stick.Parent.Visible).toBe(true)
+			local center = stick.AbsolutePosition + stick.AbsoluteSize / 2
 
-			bar.Body.pan.Activated:Fire()
-			local look = h.world.camera.CFrame.LookVector
-			local position = h.world.camera.CFrame.Position
-			local finger = h.touchDown(Vector2.new(600, 400))
-			h.drag(finger, Vector2.new(600, 400), Vector2.new(700, 400))
-			h.touchUp(finger)
-			expect(h.world.camera.CFrame.LookVector).toBeCloseTo(look, 1e-4)
-			expect((h.world.camera.CFrame.Position - position).Magnitude).toBeGreaterThan(1)
+			local before = h.world.camera.CFrame
+			local finger = h.world:input("Touch", center + Vector2.new(60, 0))
+			stick.InputBegan:Fire(finger)
+			for _ = 1, 30 do
+				h.frame()
+			end
+			local moved = h.world.camera.CFrame.Position - before.Position
+			-- Pushed right: the camera flew to its right without turning.
+			expect(moved:Dot(before.RightVector)).toBeGreaterThan(5)
+			expect(math.abs(moved:Dot(before.UpVector))).toBeLessThan(1e-3)
+			expect(h.world.camera.CFrame.LookVector).toBeCloseTo(before.LookVector, 1e-4)
 
-			bar.Body.zoom.Activated:Fire()
+			h.uis.InputEnded:Fire(finger, false)
+			local stopped = h.world.camera.CFrame.Position
+			h.frame()
+			expect(h.world.camera.CFrame.Position).toBeCloseTo(stopped)
+			expect(stick.Knob.Position.X.Offset).toBe(0)
+		end)
+
+		it("zooms with the slider", function()
+			local h = setup()
+			h.app:Open()
+			local rail = h.world.coreGui.TouchPeak.TouchPeakNavigator.Rail
+			local center = rail.AbsolutePosition + rail.AbsoluteSize / 2
 			local distance = h.world.camera.CFrame.Position.Magnitude
-			local mouse = h.world:input("MouseButton1", World.ScreenSize / 2)
-			task.wait(0.4) -- past the mouse-after-touch cooldown
-			h.uis.InputBegan:Fire(mouse, false)
-			h.uis.InputChanged:Fire(h.world:input("MouseMovement", World.ScreenSize / 2 - Vector2.new(0, 150)), false)
-			h.uis.InputEnded:Fire(mouse, false)
-			expect(h.world.camera.CFrame.Position.Magnitude).toBeLessThan(distance * 0.8)
+
+			local finger = h.world:input("Touch", center - Vector2.new(0, 60))
+			rail.InputBegan:Fire(finger)
+			for _ = 1, 30 do
+				h.frame()
+			end
+			h.uis.InputEnded:Fire(finger, false)
+			local closer = h.world.camera.CFrame.Position.Magnitude
+			expect(closer).toBeLessThan(distance * 0.7)
+
+			finger = h.world:input("Touch", center + Vector2.new(0, 60))
+			rail.InputBegan:Fire(finger)
+			for _ = 1, 30 do
+				h.frame()
+			end
+			h.uis.InputEnded:Fire(finger, false)
+			expect(h.world.camera.CFrame.Position.Magnitude).toBeGreaterThan(closer * 1.3)
 		end)
 
-		it("hides the mode bar when paused or turned off", function()
+		it("lets go of the joystick when the mouse release is lost", function()
 			local h = setup()
 			h.app:Open()
-			local bar = h.world.coreGui.TouchPeak.TouchPeakModeBar
-			bar.Body.zoom.Activated:Fire()
+			local stick = h.world.coreGui.TouchPeak.TouchPeakNavigator.Stick
+			local center = stick.AbsolutePosition + stick.AbsoluteSize / 2
+			stick.InputBegan:Fire(h.world:input("MouseButton1", center + Vector2.new(0, -60)))
+			h.frame()
+			h.uis.mouseButton1Pressed = false
+			h.frame()
+			local stopped = h.world.camera.CFrame.Position
+			h.frame()
+			expect(h.world.camera.CFrame.Position).toBeCloseTo(stopped)
+		end)
+
+		it("hides the joystick when paused or turned off", function()
+			local h = setup()
+			h.app:Open()
+			local navigator = h.world.coreGui.TouchPeak.TouchPeakNavigator
 			h.app:SetActive(false)
-			expect(bar.Visible).toBe(false)
+			expect(navigator.Visible).toBe(false)
 			h.app:SetActive(true)
-			expect(bar.Visible).toBe(true)
-			h.app.settings:Set("showModeBar", false)
-			expect(bar.Visible).toBe(false)
-			expect(h.app.recognizer:GetOneFingerMode()).toBe("rotate")
+			expect(navigator.Visible).toBe(true)
+			h.app.settings:Set("showNavigator", false)
+			expect(navigator.Visible).toBe(false)
 		end)
 
-		it("does not move the camera when the mode bar is touched", function()
+		it("does not rotate the camera when the joystick is touched", function()
 			local h = setup()
 			h.app:Open()
-			local before = h.world.camera.CFrame.Position
-			local finger = h.touchDown(Vector2.new(40, 360))
-			h.drag(finger, Vector2.new(40, 360), Vector2.new(400, 360))
+			local stick = h.world.coreGui.TouchPeak.TouchPeakNavigator.Stick
+			local center = stick.AbsolutePosition + stick.AbsoluteSize / 2
+			local before = h.world.camera.CFrame
+			local finger = h.touchDown(center)
+			h.drag(finger, center, center + Vector2.new(300, 0))
 			h.touchUp(finger)
-			expect(h.world.camera.CFrame.Position).toBeCloseTo(before)
+			expect(h.world.camera.CFrame.LookVector).toBeCloseTo(before.LookVector, 1e-6)
+		end)
+
+		it("zooms with tap-and-drag and keeps the selection", function()
+			local h = setup()
+			h.app:Open()
+			local part = h.world:part({ Size = Vector3.new(4, 4, 4), CFrame = CFrame.new(-12, 2, 0) })
+			h.world.selection:Set({ part })
+			local distance = h.world.camera.CFrame.Position.Magnitude
+			local spot = World.ScreenSize / 2
+
+			h.touchUp(h.touchDown(spot)) -- the tap alone would clear the selection
+			local finger = h.touchDown(spot)
+			h.drag(finger, spot, spot - Vector2.new(0, 200))
+			h.touchUp(finger)
+
+			expect(h.world.camera.CFrame.Position.Magnitude).toBeLessThan(distance * 0.6)
+			expect(h.world.selection:Get()[1]).toBe(part)
 		end)
 
 		it("zooms with Roblox's pinch event when raw fingers are missing", function()

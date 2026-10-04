@@ -21,7 +21,7 @@ local DEFAULTS = {
 	selectModels = true,
 	showTouches = true,
 	mouseInput = true,
-	showModeBar = true,
+	showNavigator = true,
 	language = "auto", -- "auto" | "pl" | "en"
 }
 

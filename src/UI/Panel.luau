@@ -31,12 +31,12 @@ local FOOTER_HEIGHT = 34
 
 local GESTURES = {
 	{ icon = "rotate", title = "gestureRotate", hint = "gestureRotateHint" },
-	{ icon = "zoom", title = "gestureZoom", hint = "gestureZoomHint" },
-	{ icon = "pan", title = "gesturePan", hint = "gesturePanHint" },
-	{ icon = "modes", title = "gestureModes", hint = "gestureModesHint" },
+	{ icon = "tapDrag", title = "gestureTapDrag", hint = "gestureTapDragHint" },
+	{ icon = "joystick", title = "gestureJoystick", hint = "gestureJoystickHint" },
 	{ icon = "tap", title = "gestureTap", hint = "gestureTapHint" },
 	{ icon = "doubleTap", title = "gestureDoubleTap", hint = "gestureDoubleTapHint" },
 	{ icon = "longPress", title = "gestureLongPress", hint = "gestureLongPressHint" },
+	{ icon = "zoom", title = "gestureTwoFingers", hint = "gestureTwoFingersHint" },
 }
 
 local function toVector2(position: Vector3): Vector2
@@ -519,7 +519,7 @@ function Panel:_buildSettingsPage()
 	toggle("selectModels", "selectModels", "selectModelsHint")
 	toggle("showTouches", "showTouches", "showTouchesHint")
 	toggle("mouseInput", "mouseInput", "mouseInputHint")
-	toggle("showModeBar", "showModeBar", "showModeBarHint")
+	toggle("showNavigator", "showNavigator", "showNavigatorHint")
 	choice("language", "language", {
 		{ id = "auto", label = self:_t("languageAuto") },
 		{ id = "pl", label = "PL" },

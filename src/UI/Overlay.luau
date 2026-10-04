@@ -243,6 +243,10 @@ function Overlay:Toast(text: string, color: Color3?)
 	self._toast.flash(text, color, TOAST_TIME)
 end
 
+function Overlay:HideToast()
+	self._toast.hide()
+end
+
 function Overlay:ClearTouches()
 	for id in table.clone(self._touches) do
 		self:TouchEnded(id)

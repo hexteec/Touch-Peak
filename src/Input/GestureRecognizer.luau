@@ -1,21 +1,20 @@
 --[[
 	Turns raw touch points into high level gestures.
 
-	  1 finger drag ............ depends on the one-finger mode:
-	                               "rotate" -> Rotate(delta)      -> RotateEnded(velocity)
-	                               "pan"    -> Pan(delta)         -> PanEnded(velocity)
-	                               "zoom"   -> Zoom(scale)  (drag up = closer)
+	  1 finger drag ............ Rotate(delta)         -> RotateEnded(velocity)
+	  tap, then drag ........... TapDragBegan(position), Zoom(scale)  (drag up = closer)
 	  2 fingers, apart/together  Zoom(scale, centroid)
-	  2 fingers, same direction  Pan(delta, centroid) -> PanEnded(velocity)
+	  2 fingers, same direction  Pan(delta, centroid)  -> PanEnded(velocity)
 	  quick tap ................ Tap(position)
 	  second quick tap ......... DoubleTap(position)
 	  press and hold ........... LongPress(position)
 
 	AnchorBegan(position) fires when a pan or zoom starts, with the screen
-	point the camera should zoom toward / keep under the finger.
+	point the camera should zoom toward / keep under the fingers.
 
 	Roblox Studio on Windows usually reports a touch screen as a single mouse
-	pointer, so every two-finger action also has a one-finger mode.
+	pointer, which is why zoom also works with one finger ("tap, then drag",
+	like one-handed zoom in map apps).
 
 	Touches are identified by any key (Roblox reuses the same InputObject for
 	the whole life of a finger), so the recognizer does not depend on Studio
@@ -36,23 +35,21 @@ local Signal = require(script.Parent.Parent.Util.Signal)
 
 local DEFAULT_CONFIG = {
 	tapSlop = 10, -- px a finger may drift and still count as a tap
-	doubleTapTime = 0.35, -- s between two taps
+	doubleTapTime = 0.32, -- s from lifting the finger to touching again
 	doubleTapSlop = 40, -- px between two taps
 	longPressTime = 0.6, -- s
 	twoFingerLockDistance = 10, -- px before deciding between zoom and pan
-	dragZoomRate = 1 / 220, -- one-finger zoom: dragging this many px changes distance e times
+	dragZoomRate = 1 / 220, -- tap-and-drag zoom: 220 px changes the distance e times
 	velocityWindow = 0.1, -- s of movement used for the release velocity
 	releaseStaleTime = 0.08, -- s without movement before release cancels inertia
 	maxReleaseSpeed = 2500, -- px/s
 	maxBatchDelay = 0.05, -- s two-finger movement may wait for Flush()
 }
 
-export type OneFingerMode = "rotate" | "pan" | "zoom"
-
 -- idle        nothing touching
 -- pending     one finger down, could still become a tap, a drag or a long press
 -- held        long press fired; moving now still starts a drag
--- drag        one finger dragging (see _dragKind)
+-- drag        one finger dragging: rotating, or zooming after a tap (see _dragKind)
 -- twoPending  two fingers down, not yet clear whether zoom or pan
 -- twoZoom / twoPan / twoBoth
 -- blocked     a two-finger gesture ended but a finger is still down
@@ -87,8 +84,7 @@ function GestureRecognizer.new(options: Options?)
 	end
 
 	self._combine = false
-	self._oneFingerMode = "rotate" :: OneFingerMode
-	self._dragKind = "rotate" :: OneFingerMode
+	self._dragKind = "rotate" :: "rotate" | "zoom"
 	self._mode = "idle" :: Mode
 	self._gesture = nil :: string?
 	self._touches = {} -- id -> record
@@ -109,6 +105,7 @@ function GestureRecognizer.new(options: Options?)
 	self.TouchCountChanged = Signal.new()
 	self.GestureChanged = Signal.new()
 	self.AnchorBegan = Signal.new()
+	self.TapDragBegan = Signal.new()
 	self.Rotate = Signal.new()
 	self.RotateEnded = Signal.new()
 	self.Pan = Signal.new()
@@ -123,15 +120,6 @@ end
 
 function GestureRecognizer:SetCombine(combine: boolean)
 	self._combine = combine
-end
-
--- What a one-finger drag does. Takes effect from the next drag.
-function GestureRecognizer:SetOneFingerMode(mode: OneFingerMode)
-	self._oneFingerMode = mode
-end
-
-function GestureRecognizer:GetOneFingerMode(): OneFingerMode
-	return self._oneFingerMode
 end
 
 function GestureRecognizer:GetMode(): Mode
@@ -169,12 +157,19 @@ function GestureRecognizer:TouchBegan(id: any, position: Vector2, slop: number?)
 		return
 	end
 
+	local now = self._clock()
+	local config = self._config
+	local last = self._lastTap
 	local record = {
 		id = id,
 		start = position,
 		position = position,
-		startTime = self._clock(),
-		slop = slop or self._config.tapSlop,
+		startTime = now,
+		slop = slop or config.tapSlop,
+		-- Touching again right where a tap just ended: a double tap, or a tap-and-drag zoom.
+		afterTap = last ~= nil
+			and now - last.time <= config.doubleTapTime
+			and (position - last.position).Magnitude <= config.doubleTapSlop,
 	}
 	self._touches[id] = record
 	table.insert(self._order, id)
@@ -183,7 +178,10 @@ function GestureRecognizer:TouchBegan(id: any, position: Vector2, slop: number?)
 		self._mode = "pending"
 		self._samples = {}
 		self.InteractionBegan:Fire()
-		self:_scheduleLongPress(record)
+		-- After a tap, a pause before dragging must not turn into a long press.
+		if not record.afterTap then
+			self:_scheduleLongPress(record)
+		end
 	else
 		-- A second finger turns whatever the first one was doing into a two-finger gesture.
 		self:_cancelLongPress()
@@ -281,8 +279,6 @@ function GestureRecognizer:TouchEnded(id: any, position: Vector2?)
 		self:_setGesture(nil)
 		if self._dragKind == "rotate" then
 			self.RotateEnded:Fire(self:_releaseVelocity(now))
-		elseif self._dragKind == "pan" then
-			self.PanEnded:Fire(self:_releaseVelocity(now))
 		end
 	elseif isTwoFinger(mode) then
 		self._mode = "blocked"
@@ -316,25 +312,22 @@ function GestureRecognizer:_pair()
 end
 
 function GestureRecognizer:_beginDrag(record)
-	local kind = self._oneFingerMode
+	local kind = if record.afterTap then "zoom" else "rotate"
 	self._mode = "drag"
 	self._dragKind = kind
 	self._samples = {}
 	self._lastTap = nil
 	self:_setGesture(kind)
-	if kind ~= "rotate" then
+	if kind == "zoom" then
+		self.TapDragBegan:Fire(record.start)
 		self.AnchorBegan:Fire(record.start)
 	end
 end
 
 function GestureRecognizer:_emitDrag(record, delta: Vector2, now: number)
-	local kind = self._dragKind
-	if kind == "rotate" then
+	if self._dragKind == "rotate" then
 		self:_addSample(now, delta)
 		self.Rotate:Fire(delta)
-	elseif kind == "pan" then
-		self:_addSample(now, delta)
-		self.Pan:Fire(delta, record.position)
 	elseif delta.Y ~= 0 then
 		-- Dragging up (negative Y) moves closer, like pushing the view forward.
 		self.Zoom:Fire(math.exp(delta.Y * self._config.dragZoomRate), record.start)
@@ -388,20 +381,12 @@ function GestureRecognizer:_updateTwoFinger(now: number)
 end
 
 function GestureRecognizer:_handleTap(record, now: number)
-	local position = record.position
-	local last = self._lastTap
-	local config = self._config
-
-	if
-		last
-		and now - last.time <= config.doubleTapTime
-		and (position - last.position).Magnitude <= config.doubleTapSlop
-	then
+	if record.afterTap then
 		self._lastTap = nil
-		self.DoubleTap:Fire(position)
+		self.DoubleTap:Fire(record.position)
 	else
-		self._lastTap = { time = now, position = position }
-		self.Tap:Fire(position)
+		self._lastTap = { time = now, position = record.position }
+		self.Tap:Fire(record.position)
 	end
 end
 

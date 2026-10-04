@@ -102,6 +102,92 @@ return function(t)
 			end)
 		end)
 
+		describe("Studio focus", function()
+			-- Studio's edit camera keeps aiming at Camera.Focus, so Focus has to stay
+			-- straight ahead of the camera after every move.
+			local function expectFocusAhead(camera, depth: number?)
+				local toFocus = camera.Focus.Position - camera.CFrame.Position
+				expect(toFocus.Unit:Dot(camera.CFrame.LookVector)).toBeCloseTo(1, 1e-4)
+				if depth then
+					expect(toFocus.Magnitude).toBeCloseTo(depth, 1e-3)
+				end
+			end
+
+			it("stays ahead when turning in place", function()
+				local _, controller, camera = setup({ rotateMode = "look" })
+				camera.Focus = CFrame.new(0, 0, 0) -- Studio's own focus, 50 studs ahead
+				local depth = camera.CFrame.Position.Magnitude
+				controller:BeginInteraction()
+				controller:Rotate(Vector2.new(140, 30))
+				expectFocusAhead(camera, depth)
+				controller:Rotate(Vector2.new(-60, -50))
+				expectFocusAhead(camera, depth)
+			end)
+
+			it("stays ahead when panning and zooming in place mode", function()
+				local _, controller, camera = setup({ rotateMode = "look" })
+				controller:AnchorAt(Vector2.new(900, 450))
+				controller:Pan(Vector2.new(50, 20))
+				expectFocusAhead(camera)
+				controller:Zoom(0.6, Vector2.new(900, 450))
+				expectFocusAhead(camera)
+				controller:Slide(Vector2.new(1, 0), 1 / 30)
+				expectFocusAhead(camera)
+			end)
+
+			it("stays ahead when zooming toward a corner in orbit mode", function()
+				local _, controller, camera = setup()
+				controller:AnchorAt(Vector2.new(1100, 600))
+				controller:Zoom(0.5, Vector2.new(1100, 600))
+				expectFocusAhead(camera)
+			end)
+
+			it("stays ahead during the focus animation", function()
+				local world, controller, camera = setup()
+				local part = world:part({ Size = Vector3.new(2, 2, 2), CFrame = CFrame.new(25, 1, -20) })
+				controller:FocusOn({ part })
+				for _ = 1, 10 do
+					controller:Step(1 / 60)
+					expectFocusAhead(camera)
+				end
+			end)
+		end)
+
+		describe("joystick and slider", function()
+			it("slides the camera the way the stick points", function()
+				local _, controller, camera = setup()
+				local before = camera.CFrame
+				controller:AnchorAt(CENTER)
+				controller:Slide(Vector2.new(0, -1), 0.5) -- stick pushed up
+				local moved = camera.CFrame.Position - before.Position
+				expect(moved:Dot(before.UpVector)).toBeGreaterThan(1)
+				expect(math.abs(moved:Dot(before.RightVector))).toBeLessThan(1e-3)
+				expect(camera.CFrame.LookVector).toBeCloseTo(before.LookVector, 1e-6)
+			end)
+
+			it("moves faster the further the stick is pushed", function()
+				local _, slow, camera = setup()
+				local start = camera.CFrame.Position
+				slow:AnchorAt(CENTER)
+				slow:Slide(Vector2.new(0.3, 0), 0.1)
+				local small = (camera.CFrame.Position - start).Magnitude
+				local _, fast, camera2 = setup()
+				fast:AnchorAt(CENTER)
+				fast:Slide(Vector2.new(1, 0), 0.1)
+				expect((camera2.CFrame.Position - start).Magnitude).toBeGreaterThan(small * 4)
+			end)
+
+			it("zooms toward the middle of the screen with the slider", function()
+				local _, controller, camera = setup()
+				local distance = camera.CFrame.Position.Magnitude
+				controller:AnchorAt(CENTER)
+				controller:RailZoom(1, 0.5)
+				expect(camera.CFrame.Position.Magnitude).toBeCloseTo(distance * math.exp(-0.9), 1e-2)
+				controller:RailZoom(-1, 0.5)
+				expect(camera.CFrame.Position.Magnitude).toBeCloseTo(distance, 1e-2)
+			end)
+		end)
+
 		describe("panning", function()
 			it("keeps the grabbed point under the fingers", function()
 				local _, controller, camera = setup()
