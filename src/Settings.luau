@@ -21,12 +21,14 @@ local DEFAULTS = {
 	selectModels = true,
 	showTouches = true,
 	mouseInput = true,
-	showNavigator = true,
+	showZoomStrip = true,
+	zoomSide = "left", -- which edge of the viewport the zoom strip sits on
 	language = "auto", -- "auto" | "pl" | "en"
 }
 
 local CHOICES = {
 	rotateMode = { orbit = true, look = true },
+	zoomSide = { left = true, right = true },
 	language = { auto = true, pl = true, en = true },
 }
 

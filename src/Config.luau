@@ -1,5 +1,5 @@
 return {
-	Version = "1.2.0",
+	Version = "1.3.0",
 	ToolbarName = "Touch Peak",
 	ButtonId = "TouchPeakToggle",
 	ButtonText = "Touch Peak",

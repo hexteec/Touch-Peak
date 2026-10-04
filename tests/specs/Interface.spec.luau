@@ -77,17 +77,23 @@ return function(t)
 			local x = root.Position.X.Offset
 			h.gui:GetPropertyChangedSignal("AbsoluteSize"):Fire()
 			expect(root.Position.X.Offset).toBe(x)
-			expect(x).toBe(World.ScreenSize.X - 324 - 24)
+			expect(x).toBe(World.ScreenSize.X - 312 - 20)
 		end)
 
-		it("shows the active state in the header", function()
+		it("shows the state, the move in its axis colour and the summit light", function()
 			local h = setup()
 			local label = find(h.gui, "Status").Label
-			expect(label.Text).toBe("Aktywny")
+			local summit = find(h.gui, "Logo").Summit
+			local Color = h.world:require("UI/Theme").Color
+			expect(label.Text).toBe("Włączony")
+			expect(summit.BackgroundColor3).toBe(Color.Green)
 			h.panel:SetGesture("zoom")
-			expect(label.Text).toBe("Aktywny · Przybliżanie")
+			expect(label.Text).toBe('Włączony   <font color="#4C8DF6">Zoom</font>')
+			h.panel:SetGesture("pan")
+			expect(string.find(label.Text, "#EF5350", 1, true) ~= nil).toBe(true)
 			h.panel:SetActive(false)
 			expect(label.Text).toBe("Wstrzymany")
+			expect(summit.BackgroundColor3).toBe(Color.Amber)
 		end)
 
 		it("collapses into a pill and expands again", function()
@@ -96,11 +102,12 @@ return function(t)
 			local root = find(h.gui, "TouchPeakPanel")
 			h.panel:SetCollapsed(true)
 			expect(h.panel:IsCollapsed()).toBe(true)
-			expect(root.Size.Y.Offset).toBe(62)
+			expect(root.Size.Y.Offset).toBe(46)
 			task.wait(0.35)
 			expect(find(h.gui, "Content").Visible).toBe(false)
 			h.panel:SetCollapsed(false)
 			expect(find(h.gui, "Content").Visible).toBe(true)
+			expect(find(h.gui, "Status").Visible).toBe(true)
 			expect(root.Size.Y.Offset).toBeGreaterThan(400)
 		end)
 
@@ -114,10 +121,10 @@ return function(t)
 			expect(h.calls.close).toBe(1)
 		end)
 
-		it("reports clicks on the touch toggle", function()
+		it("reports clicks on the on/off switch", function()
 			local h = setup()
-			local toggle = find(h.gui, "StatusCard").Toggle
-			toggle.Activated:Fire()
+			local switch = find(h.gui, "Status").Switch
+			switch.Activated:Fire()
 			expect(h.calls.active[1]).toBe(false)
 		end)
 
@@ -213,12 +220,23 @@ return function(t)
 			expect(stepper.Value.Text).toBe("1.0×")
 		end)
 
-		it("shows touch detection", function()
+		it("shows diagnostics", function()
 			local h = setup()
+			local function value(title: string)
+				for _, row in find(h.gui, "Pages").Settings:GetChildren() do
+					if row:FindFirstChild("Title") and row.Title.Text == title and row:FindFirstChild("Value") then
+						return row.Value.Text
+					end
+				end
+				error("no row " .. title)
+			end
+			expect(value("Ostatnie wejście")).toBe("brak")
+			expect(value("Ekran dotykowy")).toBe("nie wykryto")
 			h.panel:SetTouchDetected(true)
-			h.panel:SetTouchCount(2)
-			local chips = find(h.gui, "Chips")
-			expect(string.find(chips.Fingers.Text, "2", 1, true) ~= nil).toBe(true)
+			h.panel:SetTouchCount(1, true)
+			expect(value("Ekran dotykowy")).toBe("wykryty")
+			expect(value("Ostatnie wejście")).toBe("mysz")
+			expect(value("Wersja")).toBe(h.world:require("Config").Version)
 		end)
 
 		it("cleans up after itself", function()
@@ -245,13 +263,13 @@ return function(t)
 			h.overlay:TouchEnded("a")
 			h.overlay:TouchEnded("b")
 			h.overlay:Ripple(Vector2.new(50, 50))
-			h.overlay:ShowGesture("Obrót")
-			h.overlay:ShowGesture(nil)
+			h.overlay:ShowGesture("Obrót", h.world:require("UI/Theme").Color.Green)
+			h.overlay:ShowGesture(nil, nil)
 			h.overlay:Toast("Zaznaczono: Part")
 			task.wait(0.5)
 			local remaining = 0
 			for _, child in root:GetChildren() do
-				if child:FindFirstChild("Core") or child:FindFirstChild("Stroke") and child.Size.X.Offset == 76 then
+				if child:FindFirstChild("Core") or child:FindFirstChild("Stroke") and child.Size.X.Offset == 58 then
 					remaining += 1
 				end
 			end
@@ -270,17 +288,75 @@ return function(t)
 	end)
 
 	describe("GestureIcons", function()
-		it("builds every icon with looping animations", function()
+		it("builds every legend glyph", function()
 			local world = World.new()
 			local Icons = world:require("UI/GestureIcons")
-			for _, name in { "rotate", "zoom", "pan", "tap", "doubleTap", "longPress" } do
-				local icon, tweens = Icons[name]()
-				expect(icon:IsA("Frame")).toBe(true)
-				expect(#tweens > 0).toBe(true)
-				for _, tween in tweens do
-					tween:Play()
-				end
+			for _, name in { "drag", "tapDrag", "strip", "tap", "doubleTap", "hold", "twoFingers" } do
+				expect(Icons[name]():IsA("Frame")).toBe(true)
 			end
+		end)
+	end)
+
+	describe("ZoomStrip", function()
+		local function strip(side: string?)
+			local world = World.new()
+			local ZoomStrip = world:require("UI/ZoomStrip")
+			local gui = world.newInstance("ScreenGui")
+			gui.Parent = world.coreGui
+			local zoom = ZoomStrip.new({ parent = gui, side = side or "left" })
+			zoom:SetVisible(true)
+			return world, zoom, gui.TouchPeakZoomStrip
+		end
+
+		it("reports finger movement and scrolls its ticks with it", function()
+			local world, zoom, root = strip()
+			local moves, began, ended = {}, 0, 0
+			zoom.Began:Connect(function()
+				began += 1
+			end)
+			zoom.Moved:Connect(function(dy)
+				table.insert(moves, dy)
+			end)
+			zoom.Ended:Connect(function()
+				ended += 1
+			end)
+			local ticks = root.Body.Ticks:GetChildren()
+			local before = ticks[2].Position.Y.Offset
+
+			local finger = world:input("Touch", Vector2.new(30, 360))
+			root.Body.InputBegan:Fire(finger)
+			finger.Position = World.Vector3.new(30, 340, 0)
+			world.userInputService.InputChanged:Fire(finger)
+			finger.Position = World.Vector3.new(30, 333, 0)
+			world.userInputService.InputChanged:Fire(finger)
+			world.userInputService.InputEnded:Fire(finger)
+
+			expect(began).toBe(1)
+			expect(ended).toBe(1)
+			expect(moves[1]).toBe(-20)
+			expect(moves[2]).toBe(-7)
+			-- The scale moved up 27 px with the finger (it repeats every 5 ticks of 11 px).
+			expect((ticks[2].Position.Y.Offset - (before - 27)) % 55).toBe(0)
+			expect(ticks[2].Position.Y.Offset).never(before)
+		end)
+
+		it("sits on either edge and blocks touches on itself", function()
+			local _, zoom, root = strip("right")
+			expect(root.AnchorPoint.X).toBe(1)
+			local middle = root.Body.AbsolutePosition + root.Body.AbsoluteSize / 2
+			expect(zoom:ContainsPoint(middle)).toBe(true)
+			expect(zoom:ContainsPoint(Vector2.new(400, 360))).toBe(false)
+			zoom:SetSide("left")
+			expect(root.AnchorPoint.X).toBe(0)
+		end)
+
+		it("lets go when the mouse release is lost", function()
+			local world, zoom, root = strip()
+			root.Body.InputBegan:Fire(world:input("MouseButton1", Vector2.new(30, 360)))
+			expect(zoom:IsHeld()).toBe(true)
+			world.userInputService.mouseButton1Pressed = false
+			world.userInputService.InputChanged:Fire(world:input("MouseMovement", Vector2.new(30, 300)))
+			expect(zoom:IsHeld()).toBe(false)
 		end)
 	end)
 end

@@ -548,6 +548,13 @@ function World.new()
 		world._data[tween].tweenState.playing = false
 	end
 
+	-- Rough Builder Sans metrics: half the font size per character.
+	local textService = {}
+	function textService.GetTextSize(_, text, size, font, _frame)
+		assert(typeof(font) == "EnumItem", "GetTextSize takes an Enum.Font")
+		return Vector2.new(math.ceil(utf8.len(text) * size * 0.5), size)
+	end
+
 	local runService = { Heartbeat = self.heartbeat }
 	function runService.IsEdit(_)
 		return true
@@ -559,6 +566,7 @@ function World.new()
 		Selection = selection,
 		UserInputService = userInputService,
 		TweenService = tweenService,
+		TextService = textService,
 		RunService = runService,
 		StudioService = { StudioLocaleId = "en-us" },
 		LocalizationService = { SystemLocaleId = "en-us" },

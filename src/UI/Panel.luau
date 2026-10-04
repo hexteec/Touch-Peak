@@ -1,16 +1,15 @@
 --[[
 	The floating Touch Peak window drawn over the viewport.
 
-	  * The header is a drag handle (mouse or finger) and shows whether touch
-	    controls are active, with a pulsing status dot.
-	  * The chevron collapses the window into a compact pill; tapping the pill
-	    expands it again.
-	  * "Gestures" lists every control with a small animation, "Settings"
-	    holds sensitivities and options.
+	  * Header: the peak logo (its summit light shows whether touch controls
+	    are on), the wordmark, collapse and close. Dragging the header moves
+	    the window; when collapsed, tapping it opens the window again.
+	  * Status line: on/paused, the camera move in progress (in its axis
+	    colour) and the on/off switch.
+	  * "Gestures" is a legend of what each touch does; "Settings" is a list.
 ]]
 
 local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
 
 local Config = require(script.Parent.Parent.Config)
 local Maid = require(script.Parent.Parent.Util.Maid)
@@ -23,20 +22,34 @@ local GestureIcons = require(script.Parent.GestureIcons)
 local Color = Theme.Color
 local Font = Theme.Font
 local Size = Theme.Size
+local Radius = Theme.Radius
 
 local DRAG_THRESHOLD = 6
-local HEADER_BUTTONS_WIDTH = 100
-local PAGES_TOP = 142
-local FOOTER_HEIGHT = 34
+local HEADER_BUTTONS_WIDTH = 84
+local CONTENT_TOP = Size.Header + Size.Status
+local PAGES_TOP = Size.Tabs + 4
 
-local GESTURES = {
-	{ icon = "rotate", title = "gestureRotate", hint = "gestureRotateHint" },
-	{ icon = "tapDrag", title = "gestureTapDrag", hint = "gestureTapDragHint" },
-	{ icon = "joystick", title = "gestureJoystick", hint = "gestureJoystickHint" },
-	{ icon = "tap", title = "gestureTap", hint = "gestureTapHint" },
-	{ icon = "doubleTap", title = "gestureDoubleTap", hint = "gestureDoubleTapHint" },
-	{ icon = "longPress", title = "gestureLongPress", hint = "gestureLongPressHint" },
-	{ icon = "zoom", title = "gestureTwoFingers", hint = "gestureTwoFingersHint" },
+-- Gesture legend: what you do, and what it does (coloured like the camera move).
+local LEGEND = {
+	{ icon = "drag", action = "actDrag", effect = "effDrag", color = Color.Green },
+	{ icon = "tapDrag", action = "actTapDrag", effect = "effTapDrag", color = Color.Red },
+	{ icon = "strip", action = "actStrip", effect = "effStrip", color = Color.Blue },
+	{ icon = "tap", action = "actTap", effect = "effTap" },
+	{ icon = "doubleTap", action = "actDoubleTap", effect = "effDoubleTap" },
+	{ icon = "hold", action = "actHold", effect = "effHold" },
+	{ icon = "twoFingers", action = "actTwoFingers", effect = "effTwoFingers" },
+}
+
+local EMPTY_STATS = {
+	touchBegan = 0,
+	touchChanged = 0,
+	touchEnded = 0,
+	touchFingers = 0,
+	mouseDown = 0,
+	mouseMoves = 0,
+	wheel = 0,
+	pinch = 0,
+	pan = 0,
 }
 
 local function toVector2(position: Vector3): Vector2
@@ -46,6 +59,44 @@ end
 local function isPointer(input: InputObject): boolean
 	local inputType = input.UserInputType
 	return inputType == Enum.UserInputType.MouseButton1 or inputType == Enum.UserInputType.Touch
+end
+
+local function hex(color: Color3): string
+	local function byte(channel: number): number
+		return math.floor(channel * 255 + 0.5)
+	end
+	return string.format("#%02X%02X%02X", byte(color.R), byte(color.G), byte(color.B))
+end
+
+-- The logo: two peaks, the front one with a light on its summit.
+local function peakLogo(): (Frame, Frame)
+	-- Bars of a peak: `length` long at 60 degrees, meeting at `apex`.
+	local function peak(apex: Vector2, length: number, color: Color3)
+		local dx, dy = length * 0.25, length * 0.433 -- half of cos/sin 60
+		return Components.bar(length, 2, -60, UDim2.fromOffset(apex.X - dx, apex.Y + dy), color),
+			Components.bar(length, 2, 60, UDim2.fromOffset(apex.X + dx, apex.Y + dy), color)
+	end
+	local backLeft, backRight = peak(Vector2.new(17, 8), 8, Color.Dim)
+	local frontLeft, frontRight = peak(Vector2.new(9, 3), 13, Color.Bone)
+	local summit = Create.dot(5, Color.Green, UDim2.fromOffset(9, 0))
+
+	local logo = Create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, Size.Inset, 0.5, 1),
+		Size = UDim2.fromOffset(24, 16),
+		BackgroundTransparency = 1,
+	}, {
+		BackLeft = backLeft,
+		BackRight = backRight,
+		FrontLeft = frontLeft,
+		FrontRight = frontRight,
+		Summit = summit,
+	})
+	for _, part in { frontLeft, frontRight } do
+		part.ZIndex = 2
+	end
+	summit.ZIndex = 3
+	return logo, summit
 end
 
 local Panel = {}
@@ -67,28 +118,26 @@ function Panel.new(params: Params)
 	self._settings = params.settings
 	self._locale = params.locale
 	self._maid = Maid.new()
-	self._loops = {}
 	self._controls = {}
 	self._visible = false
 	self._visibleToken = 0
 	self._collapseToken = 0
 	self._collapsed = false
 	self._active = params.active
-	self._touchCount = 0
-	self._viaMouse = false
 	self._gesture = nil
+	self._inputSource = nil
 	self._drag = nil
 	self._tab = if self._settings:GetState("tab") == "settings" then "settings" else "gestures"
 
 	self:_build()
-	self:_buildGesturesPage()
-	self:_buildSettingsPage()
+	self:_buildLegend()
+	self:_buildSettings()
 	self:_bindDrag()
 	self:_restorePosition()
 	self:_selectTab(self._tab, true)
 	self:SetTouchDetected(params.touchDetected)
+	self:SetInputStats(nil)
 	self:SetActive(params.active, true)
-	self:_refreshChips()
 
 	self._maid:Give(params.parent:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
 		if not self._customPosition then
@@ -113,32 +162,10 @@ end
 -- Construction -------------------------------------------------------------------
 
 function Panel:_build()
-	-- Header ------------------------------------------------------------------
-	local logo = Create("Frame", {
-		Position = UDim2.fromOffset(14, 13),
-		Size = UDim2.fromOffset(36, 36),
-		BackgroundColor3 = Color.White,
-	}, {
-		Create.corner(11),
-		Create.accentGradient(45),
-		Ring = Create.ring(20, Color.White, 0.3, 2),
-		Dot = Create.dot(8, Color.White),
-	})
+	local inset = Size.Inset
 
-	local statusPulse = Create.dot(8, Color.Success, UDim2.new(0, 4, 0.5, 0))
-	statusPulse.BackgroundTransparency = 0.4
-	statusPulse.ZIndex = 1
-	local statusDot = Create.dot(8, Color.Success, UDim2.new(0, 4, 0.5, 0))
-	statusDot.ZIndex = 2
-	local statusLabel = Create("TextLabel", {
-		Position = UDim2.fromOffset(15, 0),
-		Size = UDim2.new(1, -15, 1, 0),
-		FontFace = Font.SemiBold,
-		TextSize = 12,
-		TextColor3 = Color.Success,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-	})
-
+	-- Header: logo, wordmark, collapse, close.
+	local logo, summit = peakLogo()
 	local chevron = Components.ChevronGlyph()
 	local collapseButton = Components.IconButton({
 		glyph = chevron,
@@ -146,15 +173,14 @@ function Panel:_build()
 			self:SetCollapsed(not self._collapsed)
 		end,
 	})
-	collapseButton.instance.Position = UDim2.new(1, -54, 0.5, 0)
-
+	collapseButton.instance.Position = UDim2.new(1, -48, 0.5, 0)
 	local closeButton = Components.IconButton({
 		glyph = Components.CloseGlyph(),
 		onActivated = function()
 			self._params.onClose()
 		end,
 	})
-	closeButton.instance.Position = UDim2.new(1, -14, 0.5, 0)
+	closeButton.instance.Position = UDim2.new(1, -12, 0.5, 0)
 
 	local dragHandle = Create("TextButton", {
 		Size = UDim2.new(1, -HEADER_BUTTONS_WIDTH, 1, 0),
@@ -166,177 +192,114 @@ function Panel:_build()
 		BackgroundTransparency = 1,
 		ZIndex = 2,
 	}, {
+		Grip = Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0),
+			Position = UDim2.new(0.5, 0, 0, 5),
+			Size = UDim2.fromOffset(22, 3),
+			BackgroundColor3 = Color.Dim,
+			BackgroundTransparency = 0.3,
+		}, { Create.round() }),
 		Logo = logo,
-		Title = Create("TextLabel", {
-			Position = UDim2.fromOffset(62, 12),
-			Size = UDim2.new(1, -62 - HEADER_BUTTONS_WIDTH + 8, 0, 20),
-			Text = Config.ToolbarName,
-			FontFace = Font.ExtraBold,
-			TextSize = 17,
+		Wordmark = Create("TextLabel", {
+			Position = UDim2.fromOffset(inset + 32, 0),
+			Size = UDim2.new(1, -(inset + 32) - HEADER_BUTTONS_WIDTH, 1, 0),
+			Text = "touch peak",
+			FontFace = Font.Wordmark,
+			TextSize = 13,
 			TextTruncate = Enum.TextTruncate.AtEnd,
-		}),
-		Status = Create("Frame", {
-			Position = UDim2.fromOffset(62, 34),
-			Size = UDim2.new(1, -62 - HEADER_BUTTONS_WIDTH + 8, 0, 16),
-			BackgroundTransparency = 1,
-		}, {
-			Pulse = statusPulse,
-			Dot = statusDot,
-			Label = statusLabel,
 		}),
 		DragHandle = dragHandle,
 		Collapse = collapseButton.instance,
 		Close = closeButton.instance,
 	})
 
-	-- Status card ---------------------------------------------------------------
-	local toggle = Components.Toggle({
+	-- Status line: state, current move, switch.
+	local switch = Components.Switch({
 		value = self._active,
 		onChanged = function(value)
 			self._params.onActiveChanged(value)
 		end,
 	})
-	toggle.instance.Position = UDim2.new(1, -14, 0.5, 0)
+	switch.instance.Position = UDim2.new(1, -inset, 0.5, 0)
 
-	local fingersChip = Components.Chip(1)
-	local gestureChip = Components.Chip(2)
-
-	local statusCard = Create("Frame", {
-		Position = UDim2.fromOffset(Size.Padding, 12),
-		Size = UDim2.new(1, -Size.Padding * 2, 0, 72),
-		BackgroundColor3 = Color.Surface,
-	}, {
-		Create.corner(14),
-		Create.stroke(Color.White, 0.93),
-		Title = Create("TextLabel", {
-			Position = UDim2.fromOffset(14, 12),
-			Size = UDim2.new(1, -84, 0, 20),
-			Text = self:_t("touchControl"),
-			FontFace = Font.Bold,
-			TextSize = 15,
-			TextTruncate = Enum.TextTruncate.AtEnd,
-		}),
-		Chips = Create("Frame", {
-			Position = UDim2.fromOffset(14, 38),
-			Size = UDim2.new(1, -84, 0, 22),
-			BackgroundTransparency = 1,
-			ClipsDescendants = true,
-		}, {
-			Create.list(6, Enum.FillDirection.Horizontal),
-			Fingers = fingersChip,
-			Gesture = gestureChip,
-		}),
-		Toggle = toggle.instance,
+	local statusLabel = Create("TextLabel", {
+		Position = UDim2.fromOffset(inset, 0),
+		Size = UDim2.new(1, -inset * 2 - 52, 1, 0),
+		FontFace = Font.Medium,
+		TextSize = 14,
+		RichText = true,
+		TextTruncate = Enum.TextTruncate.AtEnd,
 	})
 
-	-- Tabs and pages -----------------------------------------------------------
-	local tabs = Components.Segmented({
+	local status = Create("Frame", {
+		Position = UDim2.fromOffset(0, Size.Header),
+		Size = UDim2.new(1, 0, 0, Size.Status),
+		BackgroundTransparency = 1,
+	}, {
+		Label = statusLabel,
+		Switch = switch.instance,
+	})
+
+	-- Tabs and their pages.
+	local tabs = Components.Tabs({
 		options = {
 			{ id = "gestures", label = self:_t("tabGestures") },
 			{ id = "settings", label = self:_t("tabSettings") },
 		},
 		value = self._tab,
-		size = UDim2.new(1, -Size.Padding * 2, 0, 36),
 		onChanged = function(id)
 			self:_selectTab(id)
 		end,
 	})
-	tabs.instance.Position = UDim2.fromOffset(Size.Padding, 96)
+	tabs.instance.Position = UDim2.fromOffset(inset, 0)
+	tabs.instance.Size = UDim2.new(1, -inset * 2, 0, Size.Tabs)
 
 	local function page(): ScrollingFrame
 		return Create("ScrollingFrame", {
 			Size = UDim2.fromScale(1, 1),
 		}, {
-			Create.padding(2, Size.Padding, 14, Size.Padding),
-			Create.list(6),
+			Create.padding(4, inset, inset, inset),
+			Create.list(0),
 		})
 	end
-	local gesturesPage = page()
+	local legendPage = page()
 	local settingsPage = page()
 
 	local pages = Create("Frame", {
 		Position = UDim2.fromOffset(0, PAGES_TOP),
-		Size = UDim2.new(1, 0, 1, -PAGES_TOP - FOOTER_HEIGHT),
+		Size = UDim2.new(1, 0, 1, -PAGES_TOP),
 		BackgroundTransparency = 1,
 		ClipsDescendants = true,
 	}, {
-		Gestures = gesturesPage,
+		Gestures = legendPage,
 		Settings = settingsPage,
 	})
 
-	local footer = Create("Frame", {
-		AnchorPoint = Vector2.new(0, 1),
-		Position = UDim2.new(0, Size.Padding, 1, 0),
-		Size = UDim2.new(1, -Size.Padding * 2, 0, FOOTER_HEIGHT),
-		BackgroundTransparency = 1,
-	}, {
-		Divider = Create("Frame", {
-			Size = UDim2.new(1, 0, 0, 1),
-			BackgroundColor3 = Color.White,
-			BackgroundTransparency = 0.93,
-		}),
-		Hint = Create("TextLabel", {
-			Size = UDim2.new(1, -56, 1, 0),
-			Text = self:_t("dragHint"),
-			FontFace = Font.Regular,
-			TextSize = 11,
-			TextColor3 = Color.TextFaint,
-			TextTruncate = Enum.TextTruncate.AtEnd,
-		}),
-		Version = Create("TextLabel", {
-			AnchorPoint = Vector2.new(1, 0),
-			Position = UDim2.fromScale(1, 0),
-			Size = UDim2.new(0, 56, 1, 0),
-			Text = "v" .. Config.Version,
-			FontFace = Font.SemiBold,
-			TextSize = 11,
-			TextColor3 = Color.TextFaint,
-			TextXAlignment = Enum.TextXAlignment.Right,
-		}),
-	})
-
 	local content = Create("Frame", {
-		Position = UDim2.fromOffset(0, Size.Header),
-		Size = UDim2.new(1, 0, 1, -Size.Header),
+		Position = UDim2.fromOffset(0, CONTENT_TOP),
+		Size = UDim2.new(1, 0, 1, -CONTENT_TOP),
 		BackgroundTransparency = 1,
 	}, {
-		Divider = Create("Frame", {
-			Position = UDim2.fromOffset(Size.Padding, 0),
-			Size = UDim2.new(1, -Size.Padding * 2, 0, 1),
-			BackgroundColor3 = Color.White,
-			BackgroundTransparency = 0.93,
-		}),
-		StatusCard = statusCard,
 		Tabs = tabs.instance,
+		Rule = Create("Frame", {
+			Position = UDim2.fromOffset(inset, Size.Tabs),
+			Size = UDim2.new(1, -inset * 2, 0, 1),
+			BackgroundColor3 = Color.Bone,
+			BackgroundTransparency = 0.92,
+		}),
 		Pages = pages,
-		Footer = footer,
 	})
 
-	-- Body, shadow and root ----------------------------------------------------------
 	local body = Create("Frame", {
 		Size = UDim2.fromScale(1, 1),
-		BackgroundColor3 = Color.Background,
-		BackgroundTransparency = 0.03,
+		BackgroundColor3 = Color.Graphite,
 		ClipsDescendants = true,
 		ZIndex = 2,
 	}, {
-		Create.corner(18),
-		Create.stroke(Color.White, 0.87),
-		Glow = Create("Frame", {
-			Size = UDim2.new(1, 0, 0, 160),
-			BackgroundColor3 = Color.White,
-		}, {
-			Create.corner(18),
-			Create("UIGradient", {
-				Color = Theme.AccentGradient,
-				Transparency = NumberSequence.new({
-					NumberSequenceKeypoint.new(0, 0.83),
-					NumberSequenceKeypoint.new(1, 1),
-				}),
-				Rotation = 90,
-			}),
-		}),
+		Create.corner(Radius.Panel),
+		Create.stroke(Color.Bone, 0.9),
 		Header = header,
+		Status = status,
 		Content = content,
 	})
 
@@ -352,93 +315,72 @@ function Panel:_build()
 		Body = body,
 	})
 
-	-- Soft shadow: several very faint layers, each a little larger than the last.
-	for index, layer in { { 2, 0.9 }, { 6, 0.94 }, { 12, 0.965 }, { 20, 0.98 } } do
+	for index, layer in { { 2, 0.8 }, { 12, 0.92 } } do
 		local spread, transparency = layer[1], layer[2]
 		Create("Frame", {
 			AnchorPoint = Vector2.new(0.5, 0.5),
-			Position = UDim2.new(0.5, 0, 0.5, 2 + index),
+			Position = UDim2.new(0.5, 0, 0.5, 2 + index * 2),
 			Size = UDim2.new(1, spread, 1, spread),
 			BackgroundColor3 = Color.Black,
 			BackgroundTransparency = transparency,
 			ZIndex = 1,
 			Parent = root,
-		}, { Create.corner(18 + spread / 2) })
+		}, { Create.corner(Radius.Panel + spread / 2) })
 	end
 
 	root.Parent = self._params.parent
 	self._maid:Give(root)
 
-	self._pulseTween = TweenService:Create(
-		statusPulse,
-		TweenInfo.new(1.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, -1),
-		{ Size = UDim2.fromOffset(20, 20), BackgroundTransparency = 1 }
-	)
-	self._maid:Give(self._pulseTween)
-
 	self._root = root
 	self._scale = scale
 	self._body = body
+	self._status = status
 	self._content = content
 	self._chevron = chevron
 	self._dragHandle = dragHandle
-	self._statusDot = statusDot
-	self._statusPulse = statusPulse
+	self._summit = summit
 	self._statusLabel = statusLabel
-	self._toggle = toggle
-	self._fingersChip = fingersChip
-	self._gestureChip = gestureChip
+	self._switch = switch
 	self._tabs = tabs
-	self._gesturesPage = gesturesPage
+	self._legendPage = legendPage
 	self._settingsPage = settingsPage
 end
 
-function Panel:_buildGesturesPage()
-	for index, gesture in GESTURES do
-		local icon, tweens = GestureIcons[gesture.icon]()
-		for _, tween in tweens do
-			table.insert(self._loops, tween)
-			self._maid:Give(tween)
-		end
-
+function Panel:_buildLegend()
+	for index, entry in LEGEND do
 		Create("Frame", {
 			Size = UDim2.new(1, 0, 0, 50),
-			BackgroundColor3 = Color.Surface,
+			BackgroundTransparency = 1,
 			LayoutOrder = index,
-			Parent = self._gesturesPage,
+			Parent = self._legendPage,
 		}, {
-			Create.corner(13),
-			Create.stroke(Color.White, 0.95),
-			IconBox = Create("Frame", {
-				Position = UDim2.fromOffset(7, 7),
-				Size = UDim2.fromOffset(36, 36),
-				BackgroundColor3 = Color.SurfaceHigh,
-			}, {
-				Create.corner(10),
-				Icon = icon,
-			}),
-			Title = Create("TextLabel", {
-				Position = UDim2.fromOffset(54, 7),
-				Size = UDim2.new(1, -64, 0, 19),
-				Text = self:_t(gesture.title),
-				FontFace = Font.SemiBold,
+			Glyph = Create("Frame", {
+				AnchorPoint = Vector2.new(0, 0.5),
+				Position = UDim2.fromScale(0, 0.5),
+				Size = UDim2.fromOffset(28, 28),
+				BackgroundTransparency = 1,
+			}, { Icon = GestureIcons[entry.icon]() }),
+			Action = Create("TextLabel", {
+				Position = UDim2.fromOffset(44, 8),
+				Size = UDim2.new(1, -44, 0, 18),
+				Text = self:_t(entry.action),
+				FontFace = Font.Medium,
 				TextSize = 14,
 				TextTruncate = Enum.TextTruncate.AtEnd,
 			}),
-			Hint = Create("TextLabel", {
-				Position = UDim2.fromOffset(54, 26),
-				Size = UDim2.new(1, -64, 0, 16),
-				Text = self:_t(gesture.hint),
-				FontFace = Font.Regular,
-				TextSize = 12,
-				TextColor3 = Color.TextDim,
+			Effect = Create("TextLabel", {
+				Position = UDim2.fromOffset(44, 27),
+				Size = UDim2.new(1, -44, 0, 16),
+				Text = self:_t(entry.effect),
+				TextSize = 13,
+				TextColor3 = entry.color or Color.Ash,
 				TextTruncate = Enum.TextTruncate.AtEnd,
 			}),
 		})
 	end
 end
 
-function Panel:_buildSettingsPage()
+function Panel:_buildSettings()
 	local settings = self._settings
 	local page = self._settingsPage
 	local order = 0
@@ -449,8 +391,8 @@ function Panel:_buildSettingsPage()
 		instance.Parent = page
 	end
 
-	local function section(key: string)
-		add(Components.SectionLabel(self:_t(key), 0))
+	local function group(key: string)
+		add(Components.GroupTitle(self:_t(key)))
 	end
 
 	local function stepper(key: string, title: string)
@@ -464,11 +406,11 @@ function Panel:_buildSettingsPage()
 			end,
 		})
 		self._controls[key] = control
-		add(Components.Row({ title = self:_t(title), control = control.instance, controlWidth = 112, layoutOrder = 0 }))
+		add(Components.Row({ title = self:_t(title), control = control.instance, controlWidth = 104 }))
 	end
 
-	local function toggle(key: string, title: string, hint: string?)
-		local control = Components.Toggle({
+	local function switch(key: string, title: string, hint: string?)
+		local control = Components.Switch({
 			value = settings:Get(key),
 			onChanged = function(value)
 				settings:Set(key, value)
@@ -479,8 +421,7 @@ function Panel:_buildSettingsPage()
 			title = self:_t(title),
 			hint = if hint then self:_t(hint) else nil,
 			control = control.instance,
-			controlWidth = 46,
-			layoutOrder = 0,
+			controlWidth = 40,
 		}))
 	end
 
@@ -488,61 +429,71 @@ function Panel:_buildSettingsPage()
 		local control = Components.Segmented({
 			options = options,
 			value = settings:Get(key),
-			size = UDim2.fromOffset(width, 30),
-			textSize = 12,
+			width = width,
 			onChanged = function(id)
 				settings:Set(key, id)
 			end,
 		})
 		self._controls[key] = control
-		add(
-			Components.Row({ title = self:_t(title), control = control.instance, controlWidth = width, layoutOrder = 0 })
-		)
+		add(Components.Row({ title = self:_t(title), control = control.instance, controlWidth = width }))
 	end
 
-	section("sectionSensitivity")
+	group("groupSensitivity")
 	stepper("rotateSensitivity", "rotateSpeed")
 	stepper("zoomSensitivity", "zoomSpeed")
 	stepper("panSensitivity", "panSpeed")
 
-	section("sectionCamera")
+	group("groupCamera")
 	choice("rotateMode", "rotateMode", {
 		{ id = "orbit", label = self:_t("rotateModeOrbit") },
 		{ id = "look", label = self:_t("rotateModeLook") },
 	}, 150)
-	toggle("inertia", "inertia", "inertiaHint")
-	toggle("combineGestures", "combineGestures", "combineGesturesHint")
-	toggle("invertRotate", "invertRotate", "invertRotateHint")
-	toggle("invertPan", "invertPan", "invertPanHint")
+	switch("inertia", "inertia", "inertiaHint")
+	switch("invertRotate", "invertRotate", "invertRotateHint")
+	switch("invertPan", "invertPan", "invertPanHint")
+	switch("combineGestures", "combineGestures", "combineGesturesHint")
 
-	section("sectionSelection")
-	toggle("selectModels", "selectModels", "selectModelsHint")
-	toggle("showTouches", "showTouches", "showTouchesHint")
-	toggle("mouseInput", "mouseInput", "mouseInputHint")
-	toggle("showNavigator", "showNavigator", "showNavigatorHint")
+	group("groupZoom")
+	switch("showZoomStrip", "showZoomStrip", "showZoomStripHint")
+	choice("zoomSide", "zoomSide", {
+		{ id = "left", label = self:_t("zoomSideLeft") },
+		{ id = "right", label = self:_t("zoomSideRight") },
+	}, 124)
+
+	group("groupSelection")
+	switch("selectModels", "selectModels", "selectModelsHint")
+	switch("showTouches", "showTouches", "showTouchesHint")
+	switch("mouseInput", "mouseInput", "mouseInputHint")
 	choice("language", "language", {
 		{ id = "auto", label = self:_t("languageAuto") },
 		{ id = "pl", label = "PL" },
 		{ id = "en", label = "EN" },
 	}, 138)
 
-	section("sectionInfo")
-	local touchChip = Components.Chip(0)
-	add(Components.Row({ title = self:_t("touchScreen"), control = touchChip, controlWidth = 110, layoutOrder = 0 }))
-	self._touchChip = touchChip
-
-	-- Live counters of what Studio actually delivers (touch vs. mouse).
+	group("groupDiagnostics")
 	self._diagnostics = {}
-	for _, key in { "diagTouch", "diagMouse", "diagGestures" } do
-		local row = Components.Row({ title = self:_t(key), hint = "", layoutOrder = 0 })
+	for _, key in
+		{
+			"touchScreen",
+			"diagInput",
+			"diagTouchEvents",
+			"diagTouchFingers",
+			"diagMouseClicks",
+			"diagMouseMoves",
+			"diagPinch",
+			"version",
+		}
+	do
+		local row, value = Components.ValueRow(self:_t(key))
 		add(row)
-		self._diagnostics[key] = row.Hint
+		self._diagnostics[key] = value
 	end
-	self:SetInputStats(nil)
+	self._diagnostics.version.Text = Config.Version
 
+	local spacer = Create("Frame", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1 })
+	add(spacer)
 	local reset = Components.Button({
 		text = self:_t("reset"),
-		layoutOrder = 0,
 		onActivated = function()
 			settings:Reset()
 		end,
@@ -605,7 +556,7 @@ function Panel:_bindDrag()
 			self._customPosition = true
 			self._settings:SetState("position", { x = self._position.X, y = self._position.Y })
 		elseif self._collapsed then
-			-- A plain tap on the collapsed pill opens it again.
+			-- A plain tap on the collapsed header opens the window again.
 			self:SetCollapsed(false)
 		end
 	end))
@@ -619,7 +570,7 @@ end
 
 function Panel:_expandedHeight(): number
 	local available = self:_screenSize().Y - Size.ScreenMargin * 2
-	return math.max(Size.Header + 220, math.min(Size.PanelHeight, available))
+	return math.max(CONTENT_TOP + 200, math.min(Size.PanelHeight, available))
 end
 
 function Panel:_targetSize(): Vector2
@@ -639,7 +590,7 @@ end
 
 -- Until the user drags the window it lives in the top-right corner of the viewport.
 function Panel:_defaultPosition(): Vector2
-	return Vector2.new(self:_screenSize().X - Size.PanelWidth - 24, 24)
+	return Vector2.new(self:_screenSize().X - Size.PanelWidth - 20, 20)
 end
 
 function Panel:_restorePosition()
@@ -666,7 +617,7 @@ end
 function Panel:_selectTab(id: string, instant: boolean?)
 	self._tab = id
 	local info = if instant then nil else Theme.Tween.Smooth
-	Create.animate(self._gesturesPage, info, {
+	Create.animate(self._legendPage, info, {
 		Position = UDim2.fromScale(if id == "gestures" then 0 else -1, 0),
 	})
 	Create.animate(self._settingsPage, info, {
@@ -676,7 +627,6 @@ function Panel:_selectTab(id: string, instant: boolean?)
 		self._tabs.set(id, true)
 	end
 	self._settings:SetState("tab", id)
-	self:_updateAnimations()
 end
 
 -- Public API -------------------------------------------------------------------------
@@ -702,22 +652,20 @@ function Panel:SetVisible(visible: boolean, instant: boolean?)
 		if instant then
 			self._scale.Scale = 1
 		else
-			self._scale.Scale = 0.9
-			Create.tween(self._scale, Theme.Tween.Spring, { Scale = 1 })
+			self._scale.Scale = 0.96
+			Create.tween(self._scale, Theme.Tween.Smooth, { Scale = 1 })
 		end
 	elseif instant then
 		self._root.Visible = false
 	else
 		local token = self._visibleToken
-		Create.tween(self._scale, Theme.Tween.Close, { Scale = 0.9 })
+		Create.tween(self._scale, Theme.Tween.Close, { Scale = 0.96 })
 		task.delay(Theme.Tween.Close.Time, function()
 			if token == self._visibleToken then
 				self._root.Visible = false
 			end
 		end)
 	end
-
-	self:_updateAnimations()
 end
 
 function Panel:SetCollapsed(collapsed: boolean, instant: boolean?)
@@ -729,66 +677,61 @@ function Panel:SetCollapsed(collapsed: boolean, instant: boolean?)
 
 	if not collapsed then
 		self._content.Visible = true
+		self._status.Visible = true
 	elseif instant then
 		self._content.Visible = false
+		self._status.Visible = false
 	else
 		-- Hide the content (and its inputs) once the window has shrunk.
 		local token = self._collapseToken
 		task.delay(Theme.Tween.Smooth.Time, function()
 			if token == self._collapseToken then
 				self._content.Visible = false
+				self._status.Visible = false
 			end
 		end)
 	end
 
 	self:_applyLayout(instant)
-	self:_updateAnimations()
 end
 
 function Panel:SetActive(active: boolean, instant: boolean?)
 	self._active = active
-	self._toggle.set(active, instant)
+	self._switch.set(active, instant)
 	self:_refreshStatus()
-	self:_updateAnimations()
 end
 
 -- `viaMouse` is true when the only "finger" is Studio's mouse pointer.
 function Panel:SetTouchCount(count: number, viaMouse: boolean?)
-	self._touchCount = count
-	self._viaMouse = viaMouse == true and count > 0
-	self:_refreshChips()
+	if count > 0 then
+		self._inputSource = if viaMouse then "inputMouse" else "inputTouch"
+		self._diagnostics.diagInput.Text = self:_t(self._inputSource)
+	end
 end
 
 function Panel:SetInputStats(stats)
-	local s = stats
-		or {
-			touchBegan = 0,
-			touchChanged = 0,
-			touchEnded = 0,
-			touchFingers = 0,
-			mouseDown = 0,
-			mouseMoves = 0,
-			wheel = 0,
-			pinch = 0,
-			pan = 0,
-		}
+	local s = stats or EMPTY_STATS
 	local rows = self._diagnostics
-	rows.diagTouch.Text = self:_t("diagTouchValue", s.touchBegan + s.touchChanged + s.touchEnded, s.touchFingers)
-	rows.diagTouch.TextColor3 = if s.touchFingers >= 2 then Color.Success else Color.TextDim
-	rows.diagMouse.Text = self:_t("diagMouseValue", s.mouseDown, s.mouseMoves)
-	rows.diagGestures.Text = self:_t("diagGesturesValue", s.pinch, s.pan, s.wheel)
+	rows.diagTouchEvents.Text = tostring(s.touchBegan + s.touchChanged + s.touchEnded)
+	rows.diagTouchFingers.Text = tostring(s.touchFingers)
+	rows.diagTouchFingers.TextColor3 = if s.touchFingers >= 2 then Color.Green else Color.Bone
+	rows.diagMouseClicks.Text = tostring(s.mouseDown)
+	rows.diagMouseMoves.Text = tostring(s.mouseMoves)
+	rows.diagPinch.Text = tostring(s.pinch)
+	if not self._inputSource then
+		rows.diagInput.Text = self:_t("inputNone")
+	end
 end
 
 function Panel:SetGesture(gesture: string?)
 	self._gesture = gesture
-	self:_refreshChips()
 	self:_refreshStatus()
 end
 
 function Panel:SetTouchDetected(detected: boolean)
-	local chip = self._touchChip
-	chip.Text = self:_t(if detected then "detected" else "notDetected")
-	chip.TextColor3 = if detected then Color.Success else Color.Warning
+	local label = self._diagnostics.touchScreen
+	label.Text = self:_t(if detected then "detected" else "notDetected")
+	label.TextColor3 = if detected then Color.Bone else Color.Amber
 end
 
 -- True when a screen point lies on the window (so it should not move the camera).
@@ -806,46 +749,20 @@ function Panel:ContainsPoint(point: Vector2): boolean
 end
 
 function Panel:_refreshStatus()
-	local color = if self._active then Color.Success else Color.Warning
-	local text = self:_t(if self._active then "statusActive" else "statusPaused")
-	if self._active and self._gesture then
-		text ..= " · " .. self._locale:gesture(self._gesture)
+	local active = self._active
+	self._summit.BackgroundColor3 = if active then Color.Green else Color.Amber
+
+	local text = self:_t(if active then "statusOn" else "statusPaused")
+	self._statusLabel.TextColor3 = if active then Color.Bone else Color.Amber
+	local gesture = self._gesture
+	if active and gesture then
+		local color = Theme.GestureColor[gesture] or Color.Bone
+		text ..= `   <font color="{hex(color)}">{self._locale:gesture(gesture)}</font>`
 	end
 	self._statusLabel.Text = text
-	self._statusLabel.TextColor3 = color
-	self._statusDot.BackgroundColor3 = color
-	self._statusPulse.BackgroundColor3 = color
-end
-
-function Panel:_refreshChips()
-	local highlight = '<font color="#EEF1F9">%s</font>'
-	-- Studio's mouse pointer is shown as such: it can never be more than one finger.
-	local label = self:_t(if self._viaMouse then "fingersMouse" else "fingers")
-	self._fingersChip.Text = label .. "  " .. string.format(highlight, tostring(self._touchCount))
-	self._gestureChip.Text = self:_t("gesture") .. "  " .. string.format(highlight, self._locale:gesture(self._gesture))
-end
-
-function Panel:_updateAnimations()
-	local showIcons = self._visible and not self._collapsed and self._tab == "gestures"
-	for _, tween in self._loops do
-		if showIcons then
-			tween:Play()
-		else
-			tween:Pause()
-		end
-	end
-
-	local pulse = self._visible and self._active
-	self._statusPulse.Visible = pulse
-	if pulse then
-		self._pulseTween:Play()
-	else
-		self._pulseTween:Pause()
-	end
 end
 
 function Panel:Destroy()
-	self._loops = {}
 	self._maid:Clean()
 end
 

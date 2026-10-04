@@ -131,8 +131,6 @@ return function(t)
 				expectFocusAhead(camera)
 				controller:Zoom(0.6, Vector2.new(900, 450))
 				expectFocusAhead(camera)
-				controller:Slide(Vector2.new(1, 0), 1 / 30)
-				expectFocusAhead(camera)
 			end)
 
 			it("stays ahead when zooming toward a corner in orbit mode", function()
@@ -150,41 +148,6 @@ return function(t)
 					controller:Step(1 / 60)
 					expectFocusAhead(camera)
 				end
-			end)
-		end)
-
-		describe("joystick and slider", function()
-			it("slides the camera the way the stick points", function()
-				local _, controller, camera = setup()
-				local before = camera.CFrame
-				controller:AnchorAt(CENTER)
-				controller:Slide(Vector2.new(0, -1), 0.5) -- stick pushed up
-				local moved = camera.CFrame.Position - before.Position
-				expect(moved:Dot(before.UpVector)).toBeGreaterThan(1)
-				expect(math.abs(moved:Dot(before.RightVector))).toBeLessThan(1e-3)
-				expect(camera.CFrame.LookVector).toBeCloseTo(before.LookVector, 1e-6)
-			end)
-
-			it("moves faster the further the stick is pushed", function()
-				local _, slow, camera = setup()
-				local start = camera.CFrame.Position
-				slow:AnchorAt(CENTER)
-				slow:Slide(Vector2.new(0.3, 0), 0.1)
-				local small = (camera.CFrame.Position - start).Magnitude
-				local _, fast, camera2 = setup()
-				fast:AnchorAt(CENTER)
-				fast:Slide(Vector2.new(1, 0), 0.1)
-				expect((camera2.CFrame.Position - start).Magnitude).toBeGreaterThan(small * 4)
-			end)
-
-			it("zooms toward the middle of the screen with the slider", function()
-				local _, controller, camera = setup()
-				local distance = camera.CFrame.Position.Magnitude
-				controller:AnchorAt(CENTER)
-				controller:RailZoom(1, 0.5)
-				expect(camera.CFrame.Position.Magnitude).toBeCloseTo(distance * math.exp(-0.9), 1e-2)
-				controller:RailZoom(-1, 0.5)
-				expect(camera.CFrame.Position.Magnitude).toBeCloseTo(distance, 1e-2)
 			end)
 		end)
 

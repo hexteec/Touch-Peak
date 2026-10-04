@@ -1,9 +1,10 @@
 --[[
 	Viewport feedback drawn on top of the 3D view:
-	  * glowing circles under each finger (and a line joining two fingers),
-	  * a ripple where you tap,
-	  * a pill at the bottom naming the current gesture,
-	  * short toasts at the top ("Selected: Part").
+	  * a thin ring under each finger, tinted with the colour of the camera
+	    move it is driving (and a line joining two fingers),
+	  * a ring that expands where you tap,
+	  * a tag at the bottom naming the move in progress,
+	  * short notes at the top ("Selected: Part").
 ]]
 
 local Theme = require(script.Parent.Theme)
@@ -13,52 +14,44 @@ local Maid = require(script.Parent.Parent.Util.Maid)
 local Color = Theme.Color
 local Font = Theme.Font
 
-local TOUCH_SIZE = 58
-local TOAST_TIME = 1.6
+local TOUCH_SIZE = 46
+local NOTE_TIME = 1.6
 
 local Overlay = {}
 Overlay.__index = Overlay
 
--- A pill with a coloured dot and a label that can fade in and out.
-local function makePill(parent: Instance, anchor: Vector2, position: UDim2)
-	local dot = Create.dot(8, Color.Accent, UDim2.new(0, 0, 0.5, 0))
-	dot.AnchorPoint = Vector2.new(0, 0.5)
-	dot.BackgroundTransparency = 1
+-- A small dark tag with a coloured notch on its left edge; fades in and out.
+local function makeTag(parent: Instance, anchor: Vector2, position: UDim2)
+	local notch = Create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, -9, 0.5, 0),
+		Size = UDim2.new(0, 3, 1, -12),
+		BackgroundColor3 = Color.Bone,
+		BackgroundTransparency = 1,
+	}, { Create.round() })
 
 	local label = Create("TextLabel", {
-		Position = UDim2.fromOffset(16, 0),
 		Size = UDim2.fromScale(0, 1),
 		AutomaticSize = Enum.AutomaticSize.X,
-		FontFace = Font.SemiBold,
+		FontFace = Font.Medium,
 		TextSize = 14,
 		TextTransparency = 1,
 	})
 
-	local stroke = Create.stroke(Color.White, 1)
-	local scale = Create("UIScale", { Scale = 0.9 })
-
-	local pill = Create("Frame", {
+	local tag = Create("Frame", {
 		AnchorPoint = anchor,
 		Position = position,
-		Size = UDim2.fromOffset(0, 38),
+		Size = UDim2.fromOffset(0, 32),
 		AutomaticSize = Enum.AutomaticSize.X,
-		BackgroundColor3 = Color.Background,
+		BackgroundColor3 = Color.Graphite,
 		BackgroundTransparency = 1,
 		Visible = false,
 		Parent = parent,
 	}, {
-		Create.round(),
-		Create.padding(0, 16),
-		Stroke = stroke,
-		Scale = scale,
-		Content = Create("Frame", {
-			Size = UDim2.fromScale(0, 1),
-			AutomaticSize = Enum.AutomaticSize.X,
-			BackgroundTransparency = 1,
-		}, {
-			Dot = dot,
-			Label = label,
-		}),
+		Create.corner(Theme.Radius.Tag),
+		Create.padding(0, 12, 0, 19),
+		Notch = notch,
+		Label = label,
 	})
 
 	local api = {}
@@ -67,26 +60,22 @@ local function makePill(parent: Instance, anchor: Vector2, position: UDim2)
 	function api.show(text: string, color: Color3?)
 		token += 1
 		label.Text = text
-		dot.BackgroundColor3 = color or Color.Accent
-		pill.Visible = true
-		Create.tween(pill, Theme.Tween.Fast, { BackgroundTransparency = 0.08 })
-		Create.tween(stroke, Theme.Tween.Fast, { Transparency = 0.85 })
+		notch.BackgroundColor3 = color or Color.Bone
+		tag.Visible = true
+		Create.tween(tag, Theme.Tween.Fast, { BackgroundTransparency = 0.04 })
 		Create.tween(label, Theme.Tween.Fast, { TextTransparency = 0 })
-		Create.tween(dot, Theme.Tween.Fast, { BackgroundTransparency = 0 })
-		Create.tween(scale, Theme.Tween.Spring, { Scale = 1 })
+		Create.tween(notch, Theme.Tween.Fast, { BackgroundTransparency = 0 })
 	end
 
 	function api.hide()
 		token += 1
 		local myToken = token
-		Create.tween(pill, Theme.Tween.Smooth, { BackgroundTransparency = 1 })
-		Create.tween(stroke, Theme.Tween.Smooth, { Transparency = 1 })
+		Create.tween(tag, Theme.Tween.Smooth, { BackgroundTransparency = 1 })
 		Create.tween(label, Theme.Tween.Smooth, { TextTransparency = 1 })
-		Create.tween(dot, Theme.Tween.Smooth, { BackgroundTransparency = 1 })
-		Create.tween(scale, Theme.Tween.Smooth, { Scale = 0.9 })
+		Create.tween(notch, Theme.Tween.Smooth, { BackgroundTransparency = 1 })
 		task.delay(Theme.Tween.Smooth.Time, function()
 			if token == myToken then
-				pill.Visible = false
+				tag.Visible = false
 			end
 		end)
 	end
@@ -109,6 +98,7 @@ function Overlay.new(parent: Instance, settings)
 	self._settings = settings
 	self._maid = Maid.new()
 	self._touches = {} -- id -> { frame, position }
+	self._touchColor = Color.Bone
 
 	self._root = self._maid:Give(Create("Frame", {
 		Name = "TouchPeakOverlay",
@@ -120,45 +110,41 @@ function Overlay.new(parent: Instance, settings)
 
 	self._link = Create("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
-		Size = UDim2.fromOffset(0, 3),
-		BackgroundColor3 = Color.White,
-		BackgroundTransparency = 0.35,
+		Size = UDim2.fromOffset(0, 1),
+		BackgroundColor3 = Color.Bone,
+		BackgroundTransparency = 0.45,
 		Visible = false,
 		Parent = self._root,
-	}, {
-		Create.round(),
-		Create.accentGradient(),
 	})
 
-	self._gesturePill = makePill(self._root, Vector2.new(0.5, 1), UDim2.new(0.5, 0, 1, -26))
-	self._toast = makePill(self._root, Vector2.new(0.5, 0), UDim2.new(0.5, 0, 0, 18))
+	self._gestureTag = makeTag(self._root, Vector2.new(0.5, 1), UDim2.new(0.5, 0, 1, -22))
+	self._note = makeTag(self._root, Vector2.new(0.5, 0), UDim2.new(0.5, 0, 0, 16))
 
 	return self
 end
 
--- Finger circles -----------------------------------------------------------------
+-- Finger rings -----------------------------------------------------------------------
 
 function Overlay:TouchBegan(id: any, position: Vector2)
 	if not self._settings:Get("showTouches") or self._touches[id] then
 		return
 	end
 
-	local scale = Create("UIScale", { Scale = 0.4 })
+	local scale = Create("UIScale", { Scale = 0.6 })
 	local frame = Create("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Position = UDim2.fromOffset(position.X, position.Y),
 		Size = UDim2.fromOffset(TOUCH_SIZE, TOUCH_SIZE),
-		BackgroundColor3 = Color.Accent,
-		BackgroundTransparency = 0.82,
+		BackgroundTransparency = 1,
 		ZIndex = 2,
 		Parent = self._root,
 	}, {
 		Create.round(),
-		Stroke = Create.stroke(Color.Accent, 0.1, 2),
-		Core = Create.dot(14, Color.White),
+		Stroke = Create.stroke(self._touchColor, 0.1, 2),
+		Core = Create.dot(6, Color.Bone),
 		Scale = scale,
 	})
-	Create.tween(scale, Theme.Tween.Spring, { Scale = 1 })
+	Create.tween(scale, Theme.Tween.Smooth, { Scale = 1 })
 
 	self._touches[id] = { frame = frame, position = position }
 	self:_updateLink()
@@ -183,8 +169,7 @@ function Overlay:TouchEnded(id: any)
 	self:_updateLink()
 
 	local frame = touch.frame
-	Create.tween(frame.Scale, Theme.Tween.Smooth, { Scale = 1.35 })
-	Create.tween(frame, Theme.Tween.Smooth, { BackgroundTransparency = 1 })
+	Create.tween(frame.Scale, Theme.Tween.Smooth, { Scale = 1.25 })
 	Create.tween(frame.Stroke, Theme.Tween.Smooth, { Transparency = 1 })
 	Create.tween(frame.Core, Theme.Tween.Smooth, { BackgroundTransparency = 1 })
 	task.delay(Theme.Tween.Smooth.Time, function()
@@ -208,43 +193,48 @@ function Overlay:_updateLink()
 	local middle = (a + b) / 2
 	self._link.Visible = true
 	self._link.Position = UDim2.fromOffset(middle.X, middle.Y)
-	self._link.Size = UDim2.fromOffset(offset.Magnitude, 3)
+	self._link.Size = UDim2.fromOffset(offset.Magnitude, 1)
 	self._link.Rotation = math.deg(math.atan2(offset.Y, offset.X))
 end
 
--- Expanding ring where a tap landed.
+-- A ring that expands where a tap landed.
 function Overlay:Ripple(position: Vector2, color: Color3?)
 	if not self._settings:Get("showTouches") then
 		return
 	end
-	local ring = Create.ring(16, color or Color.Accent, 0, 3, UDim2.fromOffset(position.X, position.Y))
+	local ring = Create.ring(12, color or Color.Bone, 0.1, 1.5, UDim2.fromOffset(position.X, position.Y))
 	ring.ZIndex = 2
 	ring.Parent = self._root
 
-	local info = TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-	Create.tween(ring, info, { Size = UDim2.fromOffset(76, 76) })
+	local info = TweenInfo.new(0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+	Create.tween(ring, info, { Size = UDim2.fromOffset(58, 58) })
 	Create.tween(ring.Stroke, info, { Transparency = 1 })
 	task.delay(info.Time, function()
 		ring:Destroy()
 	end)
 end
 
--- Feedback pills -----------------------------------------------------------------
+-- Tags --------------------------------------------------------------------------------
 
-function Overlay:ShowGesture(text: string?)
+-- Names the camera move in progress and tints the finger rings with its colour.
+function Overlay:ShowGesture(text: string?, color: Color3?)
+	self._touchColor = color or Color.Bone
+	for _, touch in self._touches do
+		Create.tween(touch.frame.Stroke, Theme.Tween.Fast, { Color = self._touchColor })
+	end
 	if text then
-		self._gesturePill.show(text, Color.Accent)
+		self._gestureTag.show(text, color)
 	else
-		self._gesturePill.hide()
+		self._gestureTag.hide()
 	end
 end
 
 function Overlay:Toast(text: string, color: Color3?)
-	self._toast.flash(text, color, TOAST_TIME)
+	self._note.flash(text, color, NOTE_TIME)
 end
 
 function Overlay:HideToast()
-	self._toast.hide()
+	self._note.hide()
 end
 
 function Overlay:ClearTouches()

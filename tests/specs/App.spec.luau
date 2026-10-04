@@ -246,88 +246,31 @@ return function(t)
 			expect(h.app.recognizer:GetMode()).toBe("pending")
 		end)
 
-		it("flies the camera with the joystick", function()
+		it("zooms with the edge strip: finger up moves in, down moves out", function()
 			local h = setup()
 			h.app:Open()
-			local stick = h.world.coreGui.TouchPeak.TouchPeakNavigator.Stick
-			expect(stick.Parent.Visible).toBe(true)
-			local center = stick.AbsolutePosition + stick.AbsoluteSize / 2
-
-			local before = h.world.camera.CFrame
-			local finger = h.world:input("Touch", center + Vector2.new(60, 0))
-			stick.InputBegan:Fire(finger)
-			for _ = 1, 30 do
-				h.frame()
-			end
-			local moved = h.world.camera.CFrame.Position - before.Position
-			-- Pushed right: the camera flew to its right without turning.
-			expect(moved:Dot(before.RightVector)).toBeGreaterThan(5)
-			expect(math.abs(moved:Dot(before.UpVector))).toBeLessThan(1e-3)
-			expect(h.world.camera.CFrame.LookVector).toBeCloseTo(before.LookVector, 1e-4)
-
-			h.uis.InputEnded:Fire(finger, false)
-			local stopped = h.world.camera.CFrame.Position
-			h.frame()
-			expect(h.world.camera.CFrame.Position).toBeCloseTo(stopped)
-			expect(stick.Knob.Position.X.Offset).toBe(0)
-		end)
-
-		it("zooms with the slider", function()
-			local h = setup()
-			h.app:Open()
-			local rail = h.world.coreGui.TouchPeak.TouchPeakNavigator.Rail
-			local center = rail.AbsolutePosition + rail.AbsoluteSize / 2
+			local strip = h.world.coreGui.TouchPeak.TouchPeakZoomStrip
+			expect(strip.Visible).toBe(true)
+			local body = strip.Body
+			local center = body.AbsolutePosition + body.AbsoluteSize / 2
 			local distance = h.world.camera.CFrame.Position.Magnitude
+			local look = h.world.camera.CFrame.LookVector
 
-			local finger = h.world:input("Touch", center - Vector2.new(0, 60))
-			rail.InputBegan:Fire(finger)
-			for _ = 1, 30 do
-				h.frame()
-			end
+			local finger = h.world:input("Touch", center)
+			body.InputBegan:Fire(finger)
+			h.touchMove(finger, center - Vector2.new(0, 160))
+			expect(h.world.camera.CFrame.Position.Magnitude).toBeCloseTo(distance * math.exp(-1), 0.05)
+			h.touchMove(finger, center)
+			expect(h.world.camera.CFrame.Position.Magnitude).toBeCloseTo(distance, 0.05)
 			h.uis.InputEnded:Fire(finger, false)
-			local closer = h.world.camera.CFrame.Position.Magnitude
-			expect(closer).toBeLessThan(distance * 0.7)
-
-			finger = h.world:input("Touch", center + Vector2.new(0, 60))
-			rail.InputBegan:Fire(finger)
-			for _ = 1, 30 do
-				h.frame()
-			end
-			h.uis.InputEnded:Fire(finger, false)
-			expect(h.world.camera.CFrame.Position.Magnitude).toBeGreaterThan(closer * 1.3)
+			expect(h.world.camera.CFrame.LookVector).toBeCloseTo(look, 1e-4)
 		end)
 
-		it("lets go of the joystick when the mouse release is lost", function()
+		it("does not rotate the camera when the strip is touched", function()
 			local h = setup()
 			h.app:Open()
-			local stick = h.world.coreGui.TouchPeak.TouchPeakNavigator.Stick
-			local center = stick.AbsolutePosition + stick.AbsoluteSize / 2
-			stick.InputBegan:Fire(h.world:input("MouseButton1", center + Vector2.new(0, -60)))
-			h.frame()
-			h.uis.mouseButton1Pressed = false
-			h.frame()
-			local stopped = h.world.camera.CFrame.Position
-			h.frame()
-			expect(h.world.camera.CFrame.Position).toBeCloseTo(stopped)
-		end)
-
-		it("hides the joystick when paused or turned off", function()
-			local h = setup()
-			h.app:Open()
-			local navigator = h.world.coreGui.TouchPeak.TouchPeakNavigator
-			h.app:SetActive(false)
-			expect(navigator.Visible).toBe(false)
-			h.app:SetActive(true)
-			expect(navigator.Visible).toBe(true)
-			h.app.settings:Set("showNavigator", false)
-			expect(navigator.Visible).toBe(false)
-		end)
-
-		it("does not rotate the camera when the joystick is touched", function()
-			local h = setup()
-			h.app:Open()
-			local stick = h.world.coreGui.TouchPeak.TouchPeakNavigator.Stick
-			local center = stick.AbsolutePosition + stick.AbsoluteSize / 2
+			local body = h.world.coreGui.TouchPeak.TouchPeakZoomStrip.Body
+			local center = body.AbsolutePosition + body.AbsoluteSize / 2
 			local before = h.world.camera.CFrame
 			local finger = h.touchDown(center)
 			h.drag(finger, center, center + Vector2.new(300, 0))
@@ -335,20 +278,37 @@ return function(t)
 			expect(h.world.camera.CFrame.LookVector).toBeCloseTo(before.LookVector, 1e-6)
 		end)
 
-		it("zooms with tap-and-drag and keeps the selection", function()
+		it("moves the strip to the other edge and hides it when asked", function()
+			local h = setup()
+			h.app:Open()
+			local strip = h.world.coreGui.TouchPeak.TouchPeakZoomStrip
+			expect(strip.AnchorPoint.X).toBe(0)
+			h.app.settings:Set("zoomSide", "right")
+			expect(strip.AnchorPoint.X).toBe(1)
+			h.app:SetActive(false)
+			expect(strip.Visible).toBe(false)
+			h.app:SetActive(true)
+			expect(strip.Visible).toBe(true)
+			h.app.settings:Set("showZoomStrip", false)
+			expect(strip.Visible).toBe(false)
+		end)
+
+		it("pans with tap-and-drag and keeps the selection", function()
 			local h = setup()
 			h.app:Open()
 			local part = h.world:part({ Size = Vector3.new(4, 4, 4), CFrame = CFrame.new(-12, 2, 0) })
 			h.world.selection:Set({ part })
-			local distance = h.world.camera.CFrame.Position.Magnitude
+			local look = h.world.camera.CFrame.LookVector
+			local position = h.world.camera.CFrame.Position
 			local spot = World.ScreenSize / 2
 
 			h.touchUp(h.touchDown(spot)) -- the tap alone would clear the selection
 			local finger = h.touchDown(spot)
-			h.drag(finger, spot, spot - Vector2.new(0, 200))
+			h.drag(finger, spot, spot + Vector2.new(200, 0))
 			h.touchUp(finger)
 
-			expect(h.world.camera.CFrame.Position.Magnitude).toBeLessThan(distance * 0.6)
+			expect(h.world.camera.CFrame.LookVector).toBeCloseTo(look, 1e-4)
+			expect((h.world.camera.CFrame.Position - position).Magnitude).toBeGreaterThan(5)
 			expect(h.world.selection:Get()[1]).toBe(part)
 		end)
 
@@ -365,6 +325,15 @@ return function(t)
 			expect(h.world.camera.CFrame.Position.Magnitude).toBeCloseTo(distance / 2, 0.5)
 		end)
 
+		local function diagnostic(world, title: string): string
+			for _, row in world.coreGui.TouchPeak.TouchPeakPanel.Body.Content.Pages.Settings:GetChildren() do
+				if row:FindFirstChild("Title") and row.Title.Text == title and row:FindFirstChild("Value") then
+					return row.Value.Text
+				end
+			end
+			error("no diagnostics row " .. title)
+		end
+
 		it("shows what Studio delivers in the diagnostics", function()
 			local h = setup()
 			h.app:Open()
@@ -373,31 +342,26 @@ return function(t)
 			h.touchUp(a)
 			h.touchUp(b)
 			task.wait(0.35)
-			local found = false
-			for _, label in h.world.coreGui.TouchPeak:GetDescendants() do
-				if label:IsA("TextLabel") and label.Text == "events: 4 · max fingers: 2" then
-					found = true
-				end
-			end
-			expect(found).toBe(true)
+			expect(diagnostic(h.world, "Touch events")).toBe("4")
+			expect(diagnostic(h.world, "Most fingers at once")).toBe("2")
+			expect(diagnostic(h.world, "Last input")).toBe("touch")
 		end)
 
-		it("marks a mouse-driven finger and explains it once on touch screens", function()
+		it("tells touch screen users once that Studio sends a mouse", function()
 			local h = setup()
 			h.app:Open()
 			local mouse = h.world:input("MouseButton1", Vector2.new(300, 300))
 			h.uis.InputBegan:Fire(mouse, false)
-			local chip = h.world.coreGui.TouchPeak.TouchPeakPanel.Body.Content.StatusCard.Chips.Fingers
-			expect(string.find(chip.Text, "Mouse", 1, true) ~= nil).toBe(true)
+			expect(diagnostic(h.world, "Last input")).toBe("mouse")
 			h.uis.InputChanged:Fire(h.world:input("MouseMovement", Vector2.new(400, 300)), false)
 			h.uis.InputEnded:Fire(mouse, false)
-			local hints = 0
+			local notes = 0
 			for _, label in h.world.coreGui.TouchPeak:GetDescendants() do
-				if label:IsA("TextLabel") and string.find(label.Text, "Studio sends touch as a mouse", 1, true) then
-					hints += 1
+				if label:IsA("TextLabel") and string.find(label.Text, "Studio sees touch as a mouse", 1, true) then
+					notes += 1
 				end
 			end
-			expect(hints).toBe(1)
+			expect(notes).toBe(1)
 		end)
 
 		it("ignores the mouse when the option is off", function()
@@ -434,7 +398,7 @@ return function(t)
 			-- Studio deactivates the plugin by itself.
 			h.plugin._activated = false
 			h.app:OnPluginDeactivated()
-			local label = h.world.coreGui.TouchPeak.TouchPeakPanel.Body.Header.Status.Label
+			local label = h.world.coreGui.TouchPeak.TouchPeakPanel.Body.Status.Label
 			expect(label.Text).toBe("Paused")
 			expect(h.app:IsOpen()).toBe(true)
 		end)
@@ -458,8 +422,8 @@ return function(t)
 			h.app:Open()
 			h.app.settings:Set("language", "pl")
 			task.wait(0.05)
-			local label = h.world.coreGui.TouchPeak.TouchPeakPanel.Body.Header.Status.Label
-			expect(label.Text).toBe("Aktywny")
+			local label = h.world.coreGui.TouchPeak.TouchPeakPanel.Body.Status.Label
+			expect(label.Text).toBe("Włączony")
 			local panels = 0
 			for _, child in h.world.coreGui.TouchPeak:GetChildren() do
 				if child.Name == "TouchPeakPanel" then
@@ -486,7 +450,7 @@ return function(t)
 			plugin._activated = false
 			plugin.Deactivation:Fire()
 			expect(button.active).toBe(true)
-			expect(world.coreGui.TouchPeak.TouchPeakPanel.Body.Header.Status.Label.Text).toBe("Paused")
+			expect(world.coreGui.TouchPeak.TouchPeakPanel.Body.Status.Label.Text).toBe("Paused")
 
 			button.Click:Fire()
 			expect(button.active).toBe(false)

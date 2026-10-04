@@ -110,19 +110,16 @@ local function scene(setup: (any, any) -> ())
 	return world, world.coreGui.TouchPeak
 end
 
--- Gestures tab while flying with the joystick and zooming with the slider.
+-- Gestures tab while panning with tap-and-drag, the zoom strip partly scrolled.
 writeScene(
 	"gestures",
 	scene(function(world, app)
-		local navigator = world.coreGui.TouchPeak.TouchPeakNavigator
-		local stick, rail = navigator.Stick, navigator.Rail
-		app.navigator:_move("stick", stick.AbsolutePosition + stick.AbsoluteSize / 2 + Vector2.new(34, -22))
-		app.navigator:_move("rail", rail.AbsolutePosition + rail.AbsoluteSize / 2 + Vector2.new(0, -30))
+		local Theme = world:require("UI/Theme")
+		app.zoomStrip:_scrollBy(-17)
 		app.overlay:TouchBegan("a", Vector2.new(560, 300))
 		app.panel:SetTouchDetected(true)
-		app.panel:SetTouchCount(1)
-		app.panel:SetGesture("zoom")
-		app.overlay:ShowGesture(app.locale:gesture("zoom"))
+		app.panel:SetGesture("pan")
+		app.overlay:ShowGesture(app.locale:gesture("pan"), Theme.GestureColor.pan)
 		app.overlay:Toast(app.locale:t("toastSelected", "Domek"))
 	end)
 )
@@ -143,11 +140,12 @@ writeScene(
 -- Collapsed pill while rotating, and the paused state.
 writeScene(
 	"collapsed",
-	scene(function(_, app)
+	scene(function(world, app)
+		local Theme = world:require("UI/Theme")
 		app.panel:SetCollapsed(true, true)
 		app.panel:SetGesture("rotate")
 		app.overlay:TouchBegan("a", Vector2.new(500, 420))
-		app.overlay:ShowGesture(app.locale:gesture("rotate"))
+		app.overlay:ShowGesture(app.locale:gesture("rotate"), Theme.GestureColor.rotate)
 	end)
 )
 
@@ -173,15 +171,15 @@ writeScene(
 			pinch = 0,
 			pan = 0,
 		})
-		world.coreGui.TouchPeak.TouchPeakPanel.Body.Content.Pages.Settings.CanvasPosition = Vector2.new(0, 720)
-		app.overlay:Toast(app.locale:t("toastMouseOnly"))
+		world.coreGui.TouchPeak.TouchPeakPanel.Body.Content.Pages.Settings.CanvasPosition = Vector2.new(0, 760)
+		app.overlay:Toast(app.locale:t("toastMouseOnly"), world:require("UI/Theme").Color.Amber)
 	end)
 )
 
 writeScene(
 	"paused",
-	scene(function(_, app)
+	scene(function(world, app)
 		app:SetActive(false)
-		app.overlay:Toast(app.locale:t("toastPausedByTool"))
+		app.overlay:Toast(app.locale:t("toastPausedByTool"), world:require("UI/Theme").Color.Amber)
 	end)
 )

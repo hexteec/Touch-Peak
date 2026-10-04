@@ -23,12 +23,14 @@ local SelectionController = require(script.Parent.Selection.SelectionController)
 local Theme = require(script.Parent.UI.Theme)
 local Overlay = require(script.Parent.UI.Overlay)
 local Panel = require(script.Parent.UI.Panel)
-local Navigator = require(script.Parent.UI.Navigator)
+local ZoomStrip = require(script.Parent.UI.ZoomStrip)
 
 local STATS_REFRESH = 0.25 -- s between diagnostics updates
 -- A tap followed by a drag is a zoom, not a selection: undo the tap's selection
 -- if the drag starts within this time.
 local TAP_UNDO_WINDOW = 1
+-- Zoom strip: dragging this many pixels changes the distance to the target e times.
+local STRIP_PIXELS_PER_E = 160
 
 local App = {}
 App.__index = App
@@ -63,7 +65,7 @@ function App.new(plugin: Plugin)
 	self.input = TouchInput.new(self.recognizer, {
 		isBlocked = function(position)
 			return (self.panel ~= nil and self.panel:ContainsPoint(position))
-				or (self.navigator ~= nil and self.navigator:ContainsPoint(position))
+				or (self.zoomStrip ~= nil and self.zoomStrip:ContainsPoint(position))
 		end,
 		mouseEnabled = function()
 			return self.settings:Get("mouseInput")
@@ -140,7 +142,7 @@ function App:SetActive(active: boolean)
 		end
 		if self.overlay then
 			self.overlay:ClearTouches()
-			self.overlay:ShowGesture(nil)
+			self.overlay:ShowGesture(nil, nil)
 		end
 		pcall(function()
 			if self._plugin:IsActivated() then
@@ -154,34 +156,33 @@ function App:SetActive(active: boolean)
 		self.panel:SetTouchCount(0)
 		self.panel:SetGesture(nil)
 	end
-	self:_refreshNavigator()
+	self:_refreshZoomStrip()
 end
 
 -- Runs every frame while touch controls are active.
 function App:_step(dt: number)
 	-- Both fingers have reported by now: apply this frame's two-finger movement.
 	self.recognizer:Flush()
-
-	local navigator = self.navigator
-	if navigator then
-		navigator:Step()
-		local pan = navigator:GetPan()
-		if pan.Magnitude > 0 then
-			self.camera:Slide(pan, dt)
-		end
-		local zoom = navigator:GetZoom()
-		if zoom ~= 0 then
-			self.camera:RailZoom(zoom, dt)
-		end
-	end
-
 	self.camera:Step(dt)
 end
 
--- The joystick is only useful while touch controls are running.
-function App:_refreshNavigator()
-	if self.navigator then
-		self.navigator:SetVisible(self._open and self._active and self.settings:Get("showNavigator"))
+-- The zoom strip is only useful while touch controls are running.
+function App:_refreshZoomStrip()
+	local strip = self.zoomStrip
+	if strip then
+		strip:SetSide(self.settings:Get("zoomSide"))
+		strip:SetVisible(self._open and self._active and self.settings:Get("showZoomStrip"))
+	end
+end
+
+-- Shows a camera move in the window and on the viewport.
+function App:_showGesture(gesture: string?)
+	if self.panel then
+		self.panel:SetGesture(gesture)
+	end
+	if self.overlay then
+		local text = if gesture then self.locale:gesture(gesture) else nil
+		self.overlay:ShowGesture(text, if gesture then Theme.GestureColor[gesture] else nil)
 	end
 end
 
@@ -190,7 +191,7 @@ function App:OnPluginDeactivated()
 	if self._active and not self._plugin:IsActivated() then
 		self:SetActive(false)
 		if self.overlay then
-			self.overlay:Toast(self.locale:t("toastPausedByTool"), Theme.Color.Warning)
+			self.overlay:Toast(self.locale:t("toastPausedByTool"), Theme.Color.Amber)
 		end
 	end
 end
@@ -227,25 +228,33 @@ function App:_ensureGui()
 
 	self.overlay = Overlay.new(gui, self.settings)
 	self:_createPanel()
-	self:_createNavigator()
+	self:_createZoomStrip()
 end
 
-function App:_createNavigator()
-	local navigator = Navigator.new({
+function App:_createZoomStrip()
+	local strip = ZoomStrip.new({
 		parent = self.gui,
-		locale = self.locale,
+		side = self.settings:Get("zoomSide"),
 	})
-	-- Pan and zoom aim at whatever is in the middle of the screen.
-	local function anchorAtCenter()
+	local function center(): Vector2
 		local camera = Workspace.CurrentCamera
-		if camera then
-			self.camera:AnchorAt(camera.ViewportSize / 2)
-		end
+		return if camera then camera.ViewportSize / 2 else Vector2.zero
 	end
-	navigator.PanBegan:Connect(anchorAtCenter)
-	navigator.ZoomBegan:Connect(anchorAtCenter)
-	self.navigator = navigator
-	self:_refreshNavigator()
+	strip.Began:Connect(function()
+		-- Zoom toward whatever is in the middle of the screen.
+		self.camera:BeginInteraction()
+		self.camera:AnchorAt(center())
+		self:_showGesture("zoom")
+	end)
+	strip.Moved:Connect(function(dy)
+		-- Finger up (negative dy) moves closer.
+		self.camera:Zoom(math.exp(dy / STRIP_PIXELS_PER_E), center())
+	end)
+	strip.Ended:Connect(function()
+		self:_showGesture(nil)
+	end)
+	self.zoomStrip = strip
+	self:_refreshZoomStrip()
 end
 
 function App:_createPanel()
@@ -258,7 +267,7 @@ function App:_createPanel()
 		onActiveChanged = function(active)
 			self:SetActive(active)
 			if active and self.overlay then
-				self.overlay:Toast(self.locale:t("toastResumed"), Theme.Color.Success)
+				self.overlay:Toast(self.locale:t("toastResumed"), Theme.Color.Green)
 			end
 		end,
 		onClose = function()
@@ -279,16 +288,16 @@ function App:_rebuildPanel()
 	self:_createPanel()
 	self.panel:SetCollapsed(wasCollapsed, true)
 	self.panel:SetVisible(wasVisible, true)
-	if self.navigator then
-		self.navigator:Destroy()
-		self:_createNavigator()
+	if self.zoomStrip then
+		self.zoomStrip:Destroy()
+		self:_createZoomStrip()
 	end
 end
 
 function App:_destroyGui()
-	if self.navigator then
-		self.navigator:Destroy()
-		self.navigator = nil
+	if self.zoomStrip then
+		self.zoomStrip:Destroy()
+		self.zoomStrip = nil
 	end
 	if self.panel then
 		self.panel:Destroy()
@@ -382,12 +391,7 @@ function App:_bindGestures()
 
 	-- Status readouts.
 	maid:Give(recognizer.GestureChanged:Connect(function(gesture)
-		if self.panel then
-			self.panel:SetGesture(gesture)
-		end
-		if self.overlay then
-			self.overlay:ShowGesture(if gesture then self.locale:gesture(gesture) else nil)
-		end
+		self:_showGesture(gesture)
 		if gesture then
 			self:_maybeExplainMouseOnly()
 		end
@@ -424,7 +428,7 @@ function App:_maybeExplainMouseOnly()
 	end
 	self._mouseOnlyHintShown = true
 	if self.overlay then
-		self.overlay:Toast(self.locale:t("toastMouseOnly"), Theme.Color.Warning)
+		self.overlay:Toast(self.locale:t("toastMouseOnly"), Theme.Color.Amber)
 	end
 end
 
@@ -440,8 +444,8 @@ function App:_bindSettings()
 			end)
 		elseif key == "showTouches" and not value and self.overlay then
 			self.overlay:ClearTouches()
-		elseif key == "showNavigator" then
-			self:_refreshNavigator()
+		elseif key == "showZoomStrip" or key == "zoomSide" then
+			self:_refreshZoomStrip()
 		end
 	end))
 end
@@ -453,11 +457,11 @@ function App:_onTap(position: Vector2)
 	if not overlay then
 		return
 	end
-	overlay:Ripple(position, Theme.Color.Accent)
+	overlay:Ripple(position)
 	if target then
-		overlay:Toast(self.locale:t("toastSelected", target.Name), Theme.Color.Accent)
+		overlay:Toast(self.locale:t("toastSelected", target.Name))
 	else
-		overlay:Toast(self.locale:t("toastCleared"), Theme.Color.TextDim)
+		overlay:Toast(self.locale:t("toastCleared"), Theme.Color.Ash)
 	end
 end
 
@@ -482,11 +486,11 @@ function App:_onDoubleTap(position: Vector2)
 	if not overlay then
 		return
 	end
-	overlay:Ripple(position, Theme.Color.AccentAlt)
+	overlay:Ripple(position)
 	if focused then
-		overlay:Toast(self.locale:t("toastFocused", describe(focusOn, self.locale)), Theme.Color.AccentAlt)
+		overlay:Toast(self.locale:t("toastFocused", describe(focusOn, self.locale)))
 	else
-		overlay:Toast(self.locale:t("toastNothingToFocus"), Theme.Color.TextDim)
+		overlay:Toast(self.locale:t("toastNothingToFocus"), Theme.Color.Ash)
 	end
 end
 
@@ -496,9 +500,9 @@ function App:_onLongPress(position: Vector2)
 	if not overlay or not target then
 		return
 	end
-	overlay:Ripple(position, Theme.Color.Success)
+	overlay:Ripple(position)
 	local key = if added then "toastAdded" else "toastRemoved"
-	overlay:Toast(self.locale:t(key, target.Name), if added then Theme.Color.Success else Theme.Color.Warning)
+	overlay:Toast(self.locale:t(key, target.Name), if added then Theme.Color.Bone else Theme.Color.Ash)
 end
 
 return App

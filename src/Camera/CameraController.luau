@@ -24,11 +24,6 @@ local FOCUS_DURATION = 0.45
 local FOCUS_MARGIN = 1.15
 local MAX_FOCUS_PARTS = 5000
 
--- Joystick and zoom slider (values at full deflection).
-local SLIDE_SPEED = 900 -- screen pixels per second at the depth of the anchor
-local RAIL_ZOOM_RATE = 1.8 -- 1/s: the distance shrinks e^1.8 (about 6x) per second
-local CONTROL_CURVE = 1.5 -- deflection exponent: small pushes stay precise
-
 local INERTIA_FRICTION = 7 -- 1/s; a flick at v px/s coasts another v / 7 px
 local INERTIA_START_SPEED = 80 -- px/s
 local INERTIA_STOP_SPEED = 10 -- px/s
@@ -324,36 +319,6 @@ function CameraController:Zoom(scale: number, centroid: Vector2)
 	end
 
 	self:_apply(camera, cframe + offset, newPivot)
-end
-
--- Joystick: moves the camera across the screen plane. `direction` is in screen
--- space (X right, Y down), up to length 1; the camera flies the way it points.
-function CameraController:Slide(direction: Vector2, dt: number)
-	local camera = self:_camera()
-	local amount = math.min(direction.Magnitude, 1)
-	if not camera or amount < 1e-3 then
-		return
-	end
-
-	local cframe = camera.CFrame
-	local pivot = self:_getPivot(camera)
-	local anchor = self._anchor or pivot
-	local depth = math.max((anchor - cframe.Position):Dot(cframe.LookVector), MIN_PAN_DEPTH)
-	local studsPerPixel = 2 * depth * math.tan(math.rad(camera.FieldOfView) / 2) / math.max(camera.ViewportSize.Y, 1)
-
-	local pixels = direction.Unit * (amount ^ CONTROL_CURVE) * SLIDE_SPEED * dt * self._settings:Get("panSensitivity")
-	local offset = (cframe.RightVector * pixels.X - cframe.UpVector * pixels.Y) * studsPerPixel
-	self:_apply(camera, cframe + offset, pivot + offset)
-end
-
--- Zoom slider: `amount` in [-1, 1], positive moves toward the middle of the screen.
-function CameraController:RailZoom(amount: number, dt: number)
-	local camera = self:_camera()
-	if not camera or amount == 0 then
-		return
-	end
-	local curved = math.sign(amount) * math.abs(math.clamp(amount, -1, 1)) ^ CONTROL_CURVE
-	self:Zoom(math.exp(-RAIL_ZOOM_RATE * curved * dt), camera.ViewportSize / 2)
 end
 
 function CameraController:StartInertia(kind: "rotate" | "pan", velocity: Vector2)

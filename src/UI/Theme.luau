@@ -1,47 +1,67 @@
-local FONT_FAMILY = "rbxasset://fonts/families/BuilderSans.json"
+--[[
+	Visual language: Roblox Studio's transform gizmo.
+
+	Colour carries meaning and nothing else. The three camera moves use the
+	colours of Studio's axis handles (rotate around Y = green, pan = X red,
+	zoom along Z = blue); everything else is graphite and bone white.
+]]
+
+local UI_FAMILY = "rbxasset://fonts/families/BuilderSans.json"
+local WORDMARK_FAMILY = "rbxasset://fonts/families/Michroma.json"
 
 local Theme = {}
 
 Theme.Font = {
-	Regular = Font.new(FONT_FAMILY, Enum.FontWeight.Regular),
-	Medium = Font.new(FONT_FAMILY, Enum.FontWeight.Medium),
-	SemiBold = Font.new(FONT_FAMILY, Enum.FontWeight.SemiBold),
-	Bold = Font.new(FONT_FAMILY, Enum.FontWeight.Bold),
-	ExtraBold = Font.new(FONT_FAMILY, Enum.FontWeight.ExtraBold),
+	Regular = Font.new(UI_FAMILY, Enum.FontWeight.Regular),
+	Medium = Font.new(UI_FAMILY, Enum.FontWeight.Medium),
+	SemiBold = Font.new(UI_FAMILY, Enum.FontWeight.SemiBold),
+	Bold = Font.new(UI_FAMILY, Enum.FontWeight.Bold),
+	Wordmark = Font.new(WORDMARK_FAMILY, Enum.FontWeight.Regular),
 }
 
 Theme.Color = {
-	Background = Color3.fromRGB(15, 17, 24),
-	Surface = Color3.fromRGB(23, 26, 36),
-	SurfaceHigh = Color3.fromRGB(32, 36, 49),
-	SurfaceHover = Color3.fromRGB(44, 49, 66),
-	White = Color3.fromRGB(255, 255, 255),
+	Graphite = Color3.fromRGB(35, 37, 39), -- panel body
+	Well = Color3.fromRGB(26, 27, 29), -- recessed tracks
+	Ridge = Color3.fromRGB(52, 55, 59), -- raised parts
+	Bone = Color3.fromRGB(236, 232, 223), -- text, knobs, "on"
+	Ash = Color3.fromRGB(143, 141, 134), -- secondary text
+	Dim = Color3.fromRGB(96, 95, 91), -- disabled, ticks
 	Black = Color3.fromRGB(0, 0, 0),
-	Text = Color3.fromRGB(238, 241, 249),
-	TextDim = Color3.fromRGB(150, 158, 182),
-	TextFaint = Color3.fromRGB(96, 104, 128),
-	Accent = Color3.fromRGB(0, 198, 255),
-	AccentAlt = Color3.fromRGB(132, 92, 255),
-	Success = Color3.fromRGB(56, 222, 138),
-	Warning = Color3.fromRGB(255, 188, 56),
-	Danger = Color3.fromRGB(255, 94, 116),
+
+	Red = Color3.fromRGB(239, 83, 80), -- pan (X)
+	Green = Color3.fromRGB(92, 201, 122), -- rotate (Y), "on"
+	Blue = Color3.fromRGB(76, 141, 246), -- zoom (Z)
+	Amber = Color3.fromRGB(233, 180, 76), -- paused
 }
 
-Theme.AccentGradient = ColorSequence.new(Theme.Color.Accent, Theme.Color.AccentAlt)
+-- Colour of each camera move, as reported by the gesture recognizer.
+Theme.GestureColor = {
+	rotate = Theme.Color.Green,
+	pan = Theme.Color.Red,
+	zoom = Theme.Color.Blue,
+	both = Theme.Color.Bone,
+}
 
 Theme.Tween = {
-	Fast = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-	Smooth = TweenInfo.new(0.28, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
-	Spring = TweenInfo.new(0.42, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-	Close = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+	Fast = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+	Smooth = TweenInfo.new(0.22, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+	Close = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+}
+
+Theme.Radius = {
+	Panel = 14,
+	Control = 8,
+	Tag = 6,
 }
 
 Theme.Size = {
-	PanelWidth = 324,
-	PanelHeight = 640,
-	CollapsedWidth = 264,
-	Header = 62,
-	Padding = 14,
+	PanelWidth = 312,
+	PanelHeight = 500,
+	CollapsedWidth = 232,
+	Header = 46,
+	Status = 34,
+	Tabs = 40,
+	Inset = 16,
 	ScreenMargin = 10,
 }
 

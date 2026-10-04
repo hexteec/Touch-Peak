@@ -19,8 +19,8 @@ local DEFAULTS = {
 		BorderSizePixel = 0,
 		BackgroundTransparency = 1,
 		ScrollBarThickness = 3,
-		ScrollBarImageColor3 = Theme.Color.White,
-		ScrollBarImageTransparency = 0.75,
+		ScrollBarImageColor3 = Theme.Color.Bone,
+		ScrollBarImageTransparency = 0.8,
 		ScrollingDirection = Enum.ScrollingDirection.Y,
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		CanvasSize = UDim2.new(),
@@ -29,8 +29,8 @@ local DEFAULTS = {
 	TextLabel = {
 		BorderSizePixel = 0,
 		BackgroundTransparency = 1,
-		FontFace = Theme.Font.Medium,
-		TextColor3 = Theme.Color.Text,
+		FontFace = Theme.Font.Regular,
+		TextColor3 = Theme.Color.Bone,
 		TextSize = 14,
 		TextXAlignment = Enum.TextXAlignment.Left,
 	},
@@ -38,8 +38,8 @@ local DEFAULTS = {
 		BorderSizePixel = 0,
 		BackgroundTransparency = 1,
 		AutoButtonColor = false,
-		FontFace = Theme.Font.SemiBold,
-		TextColor3 = Theme.Color.Text,
+		FontFace = Theme.Font.Medium,
+		TextColor3 = Theme.Color.Bone,
 		TextSize = 14,
 		Text = "",
 	},
@@ -95,7 +95,7 @@ end
 
 function Create.stroke(color: Color3?, transparency: number?, thickness: number?): UIStroke
 	return create("UIStroke", {
-		Color = color or Theme.Color.White,
+		Color = color or Theme.Color.Bone,
 		Transparency = transparency or 0.9,
 		Thickness = thickness or 1,
 		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
@@ -119,10 +119,6 @@ function Create.list(padding: number, direction: Enum.FillDirection?): UIListLay
 		SortOrder = Enum.SortOrder.LayoutOrder,
 		VerticalAlignment = Enum.VerticalAlignment.Top,
 	})
-end
-
-function Create.accentGradient(rotation: number?): UIGradient
-	return create("UIGradient", { Color = Theme.AccentGradient, Rotation = rotation or 0 })
 end
 
 -- A filled circle centred on `position`.

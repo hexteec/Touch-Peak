@@ -79,7 +79,7 @@ return function(t)
 			local Locale = world:require("Locale")
 			local locale = Locale.new("auto")
 			expect(locale.language).toBe("pl")
-			expect(locale:t("statusActive")).toBe("Aktywny")
+			expect(locale:t("statusOn")).toBe("Włączony")
 		end)
 
 		it("defaults to English and formats arguments", function()
