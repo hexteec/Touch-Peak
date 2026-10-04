@@ -1,0 +1,15 @@
+# Rendered UI previews (tools/preview)
+tools/preview/out/
+
+# Rojo / Studio artifacts
+*.rbxl.lock
+*.rbxlx.lock
+sourcemap.json
+roblox.yml
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+__pycache__/

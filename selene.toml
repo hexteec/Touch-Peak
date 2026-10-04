@@ -1,0 +1,5 @@
+std = "roblox"
+
+[lints]
+# Create() takes children as a mix of positional and named entries on purpose.
+mixed_table = "allow"

@@ -1,0 +1,106 @@
+return function(t)
+	local describe, it, expect, World = t.describe, t.it, t.expect, t.World
+
+	describe("Settings", function()
+		it("starts from the defaults", function()
+			local world = World.new()
+			local Settings = world:require("Settings")
+			local settings = Settings.new(world:plugin())
+			expect(settings:Get("rotateSensitivity")).toBe(1)
+			expect(settings:Get("inertia")).toBe(true)
+			expect(settings:Get("rotateMode")).toBe("orbit")
+		end)
+
+		it("persists values through the plugin", function()
+			local world = World.new()
+			local Settings = world:require("Settings")
+			local plugin = world:plugin()
+			Settings.new(plugin):Set("panSensitivity", 2.5)
+			expect(plugin._store.TouchPeak_panSensitivity).toBe(2.5)
+			expect(Settings.new(plugin):Get("panSensitivity")).toBe(2.5)
+		end)
+
+		it("repairs bad stored values", function()
+			local world = World.new()
+			local Settings = world:require("Settings")
+			local plugin = world:plugin()
+			plugin._store.TouchPeak_zoomSensitivity = 99
+			plugin._store.TouchPeak_inertia = "yes"
+			plugin._store.TouchPeak_language = "klingon"
+			local settings = Settings.new(plugin)
+			expect(settings:Get("zoomSensitivity")).toBe(3)
+			expect(settings:Get("inertia")).toBe(true)
+			expect(settings:Get("language")).toBe("auto")
+		end)
+
+		it("announces real changes only", function()
+			local world = World.new()
+			local Settings = world:require("Settings")
+			local settings = Settings.new(nil)
+			local changes = {}
+			settings.Changed:Connect(function(key, value)
+				table.insert(changes, key .. "=" .. tostring(value))
+			end)
+			settings:Set("invertPan", true)
+			settings:Set("invertPan", true)
+			settings:Set("rotateMode", "look")
+			expect(table.concat(changes, ",")).toBe("invertPan=true,rotateMode=look")
+			table.clear(changes)
+			settings:Reset()
+			table.sort(changes)
+			expect(table.concat(changes, ",")).toBe("invertPan=false,rotateMode=orbit")
+		end)
+
+		it("rejects unknown keys", function()
+			local world = World.new()
+			local Settings = world:require("Settings")
+			local ok = pcall(function()
+				Settings.new(nil):Set("nope", 1)
+			end)
+			expect(ok).toBe(false)
+		end)
+
+		it("keeps UI state separately from preferences", function()
+			local world = World.new()
+			local Settings = world:require("Settings")
+			local plugin = world:plugin()
+			local settings = Settings.new(plugin)
+			settings:SetState("position", { x = 1, y = 2 })
+			expect(settings:GetState("position").y).toBe(2)
+			settings:Reset()
+			expect(settings:GetState("position").x).toBe(1)
+		end)
+	end)
+
+	describe("Locale", function()
+		it("follows a Polish system in auto mode", function()
+			local world = World.new()
+			world.services.LocalizationService.SystemLocaleId = "pl-pl"
+			local Locale = world:require("Locale")
+			local locale = Locale.new("auto")
+			expect(locale.language).toBe("pl")
+			expect(locale:t("statusActive")).toBe("Aktywny")
+		end)
+
+		it("defaults to English and formats arguments", function()
+			local world = World.new()
+			local Locale = world:require("Locale")
+			local locale = Locale.new("auto")
+			expect(locale.language).toBe("en")
+			expect(locale:t("toastSelected", "Part")).toBe("Selected: Part")
+			expect(locale:gesture("pan")).toBe("Pan")
+			expect(locale:gesture(nil)).toBe("none")
+		end)
+
+		it("has every key in both languages", function()
+			local world = World.new()
+			local Locale = world:require("Locale")
+			for key in Locale.Strings.en do
+				expect(Locale.Strings.pl[key] ~= nil).toBe(true)
+			end
+			for key in Locale.Strings.pl do
+				expect(Locale.Strings.en[key] ~= nil).toBe(true)
+			end
+		end)
+	end)
+end
