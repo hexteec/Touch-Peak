@@ -1,12 +1,21 @@
 --[[
 	Turns raw touch points into high level gestures.
 
-	  1 finger drag ............ Rotate(delta)        -> RotateEnded(velocity)
+	  1 finger drag ............ depends on the one-finger mode:
+	                               "rotate" -> Rotate(delta)      -> RotateEnded(velocity)
+	                               "pan"    -> Pan(delta)         -> PanEnded(velocity)
+	                               "zoom"   -> Zoom(scale)  (drag up = closer)
 	  2 fingers, apart/together  Zoom(scale, centroid)
 	  2 fingers, same direction  Pan(delta, centroid) -> PanEnded(velocity)
 	  quick tap ................ Tap(position)
 	  second quick tap ......... DoubleTap(position)
 	  press and hold ........... LongPress(position)
+
+	AnchorBegan(position) fires when a pan or zoom starts, with the screen
+	point the camera should zoom toward / keep under the finger.
+
+	Roblox Studio on Windows usually reports a touch screen as a single mouse
+	pointer, so every two-finger action also has a one-finger mode.
 
 	Touches are identified by any key (Roblox reuses the same InputObject for
 	the whole life of a finger), so the recognizer does not depend on Studio
@@ -14,9 +23,8 @@
 
 	A two-finger gesture is locked to either zoom or pan once the fingers have
 	moved far enough to tell the two apart, unless `combine` is enabled.
-	After a two-finger gesture (or a long press) the remaining finger is
-	ignored until every finger is lifted, so lifting one finger never makes
-	the camera jump.
+	After a two-finger gesture the remaining finger is ignored until every
+	finger is lifted, so lifting one finger never makes the camera jump.
 
 	Roblox reports each finger in its own input event. Two-finger movement is
 	therefore collected and evaluated once per frame by `Flush()` (call it from
@@ -30,15 +38,31 @@ local DEFAULT_CONFIG = {
 	tapSlop = 10, -- px a finger may drift and still count as a tap
 	doubleTapTime = 0.35, -- s between two taps
 	doubleTapSlop = 40, -- px between two taps
-	longPressTime = 0.55, -- s
+	longPressTime = 0.6, -- s
 	twoFingerLockDistance = 10, -- px before deciding between zoom and pan
+	dragZoomRate = 1 / 220, -- one-finger zoom: dragging this many px changes distance e times
 	velocityWindow = 0.1, -- s of movement used for the release velocity
 	releaseStaleTime = 0.08, -- s without movement before release cancels inertia
-	maxReleaseSpeed = 6000, -- px/s
+	maxReleaseSpeed = 2500, -- px/s
 	maxBatchDelay = 0.05, -- s two-finger movement may wait for Flush()
 }
 
-export type Mode = "idle" | "pending" | "rotate" | "pendingTwo" | "zoom" | "pan" | "both" | "blocked"
+export type OneFingerMode = "rotate" | "pan" | "zoom"
+
+-- idle        nothing touching
+-- pending     one finger down, could still become a tap, a drag or a long press
+-- held        long press fired; moving now still starts a drag
+-- drag        one finger dragging (see _dragKind)
+-- twoPending  two fingers down, not yet clear whether zoom or pan
+-- twoZoom / twoPan / twoBoth
+-- blocked     a two-finger gesture ended but a finger is still down
+export type Mode = "idle" | "pending" | "held" | "drag" | "twoPending" | "twoZoom" | "twoPan" | "twoBoth" | "blocked"
+
+local TWO_FINGER_GESTURE = {
+	twoZoom = "zoom",
+	twoPan = "pan",
+	twoBoth = "both",
+}
 
 local GestureRecognizer = {}
 GestureRecognizer.__index = GestureRecognizer
@@ -63,6 +87,8 @@ function GestureRecognizer.new(options: Options?)
 	end
 
 	self._combine = false
+	self._oneFingerMode = "rotate" :: OneFingerMode
+	self._dragKind = "rotate" :: OneFingerMode
 	self._mode = "idle" :: Mode
 	self._gesture = nil :: string?
 	self._touches = {} -- id -> record
@@ -82,9 +108,9 @@ function GestureRecognizer.new(options: Options?)
 	self.InteractionBegan = Signal.new()
 	self.TouchCountChanged = Signal.new()
 	self.GestureChanged = Signal.new()
+	self.AnchorBegan = Signal.new()
 	self.Rotate = Signal.new()
 	self.RotateEnded = Signal.new()
-	self.TwoFingerBegan = Signal.new()
 	self.Pan = Signal.new()
 	self.PanEnded = Signal.new()
 	self.Zoom = Signal.new()
@@ -97,6 +123,15 @@ end
 
 function GestureRecognizer:SetCombine(combine: boolean)
 	self._combine = combine
+end
+
+-- What a one-finger drag does. Takes effect from the next drag.
+function GestureRecognizer:SetOneFingerMode(mode: OneFingerMode)
+	self._oneFingerMode = mode
+end
+
+function GestureRecognizer:GetOneFingerMode(): OneFingerMode
+	return self._oneFingerMode
 end
 
 function GestureRecognizer:GetMode(): Mode
@@ -115,9 +150,14 @@ function GestureRecognizer:IsTracking(id: any): boolean
 	return self._touches[id] ~= nil or self._ignored[id] ~= nil
 end
 
+local function isTwoFinger(mode: Mode): boolean
+	return mode == "twoPending" or mode == "twoZoom" or mode == "twoPan" or mode == "twoBoth"
+end
+
 -- Touch events ----------------------------------------------------------------
 
-function GestureRecognizer:TouchBegan(id: any, position: Vector2)
+-- `slop` overrides how far this finger may move and still count as a tap.
+function GestureRecognizer:TouchBegan(id: any, position: Vector2, slop: number?)
 	if self:IsTracking(id) then
 		return
 	end
@@ -134,6 +174,7 @@ function GestureRecognizer:TouchBegan(id: any, position: Vector2)
 		start = position,
 		position = position,
 		startTime = self._clock(),
+		slop = slop or self._config.tapSlop,
 	}
 	self._touches[id] = record
 	table.insert(self._order, id)
@@ -144,6 +185,7 @@ function GestureRecognizer:TouchBegan(id: any, position: Vector2)
 		self.InteractionBegan:Fire()
 		self:_scheduleLongPress(record)
 	else
+		-- A second finger turns whatever the first one was doing into a two-finger gesture.
 		self:_cancelLongPress()
 		self._lastTap = nil
 		self._samples = {}
@@ -156,9 +198,9 @@ function GestureRecognizer:TouchBegan(id: any, position: Vector2)
 		self._prevCentroid = centroid
 		self._prevDistance = distance
 
-		self._mode = "pendingTwo"
+		self._mode = "twoPending"
 		self:_setGesture(nil)
-		self.TwoFingerBegan:Fire(centroid)
+		self.AnchorBegan:Fire(centroid)
 	end
 
 	self:_updateCount()
@@ -175,23 +217,20 @@ function GestureRecognizer:TouchMoved(id: any, position: Vector2)
 	local mode = self._mode
 	local now = self._clock()
 
-	if mode == "pending" then
+	if mode == "pending" or mode == "held" then
 		local offset = position - record.start
-		if offset.Magnitude > self._config.tapSlop then
+		if offset.Magnitude > record.slop then
 			self:_cancelLongPress()
-			self._mode = "rotate"
-			self:_setGesture("rotate")
+			self:_beginDrag(record)
 			-- Include the slop so the camera catches up with the finger.
-			self:_addSample(now, offset)
-			self.Rotate:Fire(offset)
+			self:_emitDrag(record, offset, now)
 		end
-	elseif mode == "rotate" then
+	elseif mode == "drag" then
 		local delta = position - previous
 		if delta.Magnitude > 0 then
-			self:_addSample(now, delta)
-			self.Rotate:Fire(delta)
+			self:_emitDrag(record, delta, now)
 		end
-	elseif mode == "pendingTwo" or mode == "zoom" or mode == "pan" or mode == "both" then
+	elseif isTwoFinger(mode) then
 		self._pendingSince = self._pendingSince or now
 		if now - self._pendingSince >= self._config.maxBatchDelay then
 			self:Flush()
@@ -205,8 +244,7 @@ function GestureRecognizer:Flush()
 		return
 	end
 	self._pendingSince = nil
-	local mode = self._mode
-	if mode == "pendingTwo" or mode == "zoom" or mode == "pan" or mode == "both" then
+	if isTwoFinger(self._mode) then
 		self:_updateTwoFinger(self._clock())
 	end
 end
@@ -236,23 +274,28 @@ function GestureRecognizer:TouchEnded(id: any, position: Vector2?)
 		self:_cancelLongPress()
 		self._mode = "idle"
 		self:_handleTap(record, now)
-	elseif mode == "rotate" then
+	elseif mode == "held" then
+		self._mode = "idle"
+	elseif mode == "drag" then
 		self._mode = "idle"
 		self:_setGesture(nil)
-		self.RotateEnded:Fire(self:_releaseVelocity(now))
-	elseif mode == "pan" or mode == "both" then
+		if self._dragKind == "rotate" then
+			self.RotateEnded:Fire(self:_releaseVelocity(now))
+		elseif self._dragKind == "pan" then
+			self.PanEnded:Fire(self:_releaseVelocity(now))
+		end
+	elseif isTwoFinger(mode) then
 		self._mode = "blocked"
 		self:_setGesture(nil)
-		self.PanEnded:Fire(self:_releaseVelocity(now))
-	elseif mode == "zoom" or mode == "pendingTwo" then
-		self._mode = "blocked"
-		self:_setGesture(nil)
+		if mode == "twoPan" or mode == "twoBoth" then
+			self.PanEnded:Fire(self:_releaseVelocity(now))
+		end
 	end
 
 	self:_settle()
 end
 
--- Forget every finger (e.g. when the plugin gets paused).
+-- Forget every finger without firing taps or inertia (e.g. when the plugin gets paused).
 function GestureRecognizer:Cancel()
 	self:_cancelLongPress()
 	table.clear(self._touches)
@@ -272,6 +315,32 @@ function GestureRecognizer:_pair()
 	return self._touches[self._order[1]], self._touches[self._order[2]]
 end
 
+function GestureRecognizer:_beginDrag(record)
+	local kind = self._oneFingerMode
+	self._mode = "drag"
+	self._dragKind = kind
+	self._samples = {}
+	self._lastTap = nil
+	self:_setGesture(kind)
+	if kind ~= "rotate" then
+		self.AnchorBegan:Fire(record.start)
+	end
+end
+
+function GestureRecognizer:_emitDrag(record, delta: Vector2, now: number)
+	local kind = self._dragKind
+	if kind == "rotate" then
+		self:_addSample(now, delta)
+		self.Rotate:Fire(delta)
+	elseif kind == "pan" then
+		self:_addSample(now, delta)
+		self.Pan:Fire(delta, record.position)
+	elseif delta.Y ~= 0 then
+		-- Dragging up (negative Y) moves closer, like pushing the view forward.
+		self.Zoom:Fire(math.exp(delta.Y * self._config.dragZoomRate), record.start)
+	end
+end
+
 function GestureRecognizer:_updateTwoFinger(now: number)
 	local a, b = self:_pair()
 	if not (a and b) then
@@ -281,7 +350,7 @@ function GestureRecognizer:_updateTwoFinger(now: number)
 	local centroid = (a.position + b.position) / 2
 	local distance = math.max((a.position - b.position).Magnitude, 1)
 
-	if self._mode == "pendingTwo" then
+	if self._mode == "twoPending" then
 		local spread = math.abs(distance - self._startDistance)
 		local travel = (centroid - self._startCentroid).Magnitude
 		if math.max(spread, travel) < self._config.twoFingerLockDistance then
@@ -290,14 +359,14 @@ function GestureRecognizer:_updateTwoFinger(now: number)
 
 		local mode
 		if self._combine then
-			mode = "both"
+			mode = "twoBoth"
 		elseif spread > travel then
-			mode = "zoom"
+			mode = "twoZoom"
 		else
-			mode = "pan"
+			mode = "twoPan"
 		end
 		self._mode = mode
-		self:_setGesture(mode)
+		self:_setGesture(TWO_FINGER_GESTURE[mode])
 		-- _prevCentroid/_prevDistance still hold the starting values, so the
 		-- movement made while deciding is applied below.
 	end
@@ -306,11 +375,11 @@ function GestureRecognizer:_updateTwoFinger(now: number)
 	local panDelta = centroid - self._prevCentroid
 	local scale = self._prevDistance / distance
 
-	if (mode == "pan" or mode == "both") and panDelta.Magnitude > 0 then
+	if (mode == "twoPan" or mode == "twoBoth") and panDelta.Magnitude > 0 then
 		self:_addSample(now, panDelta)
 		self.Pan:Fire(panDelta, centroid)
 	end
-	if (mode == "zoom" or mode == "both") and scale ~= 1 then
+	if (mode == "twoZoom" or mode == "twoBoth") and scale ~= 1 then
 		self.Zoom:Fire(scale, centroid)
 	end
 
@@ -347,7 +416,7 @@ function GestureRecognizer:_scheduleLongPress(record)
 		if self._mode ~= "pending" or self._touches[record.id] ~= record then
 			return
 		end
-		self._mode = "blocked"
+		self._mode = "held"
 		self._lastTap = nil
 		self.LongPress:Fire(record.position)
 	end)

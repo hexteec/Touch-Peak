@@ -97,7 +97,8 @@ function contentExtent(node, size) {
 function layoutChildren(node) {
   const r = node.rect;
   const pad = padding(node, r);
-  const inner = { x: r.x + pad.l, y: r.y + pad.t, w: r.w - pad.l - pad.r, h: r.h - pad.t - pad.b };
+  const scroll = node.class === "ScrollingFrame" && node.props.CanvasPosition ? node.props.CanvasPosition : { x: 0, y: 0 };
+  const inner = { x: r.x + pad.l - scroll.x, y: r.y + pad.t - scroll.y, w: r.w - pad.l - pad.r, h: r.h - pad.t - pad.b };
   const kids = guiChildren(node);
   const list = child(node, "UIListLayout");
   if (list) {

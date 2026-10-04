@@ -504,9 +504,16 @@ function World.new()
 		InputEnded = newSignal(),
 		TouchEnded = newSignal(),
 		WindowFocusReleased = newSignal(),
+		TouchPinch = newSignal(),
+		TouchPan = newSignal(),
+		mouseButton1Pressed = true, -- what IsMouseButtonPressed(MouseButton1) reports
 	}
 	function userInputService.GetMouseLocation(_)
 		return Vector2.zero
+	end
+	function userInputService.IsMouseButtonPressed(_, inputType)
+		assert(inputType == Enum.UserInputType.MouseButton1, "only MouseButton1 is simulated")
+		return userInputService.mouseButton1Pressed
 	end
 
 	local tweenService = {}

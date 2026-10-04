@@ -109,7 +109,7 @@ return function(t)
 				local ray = camera:ScreenPointToRay(grab.X, grab.Y)
 				local point = ray.Origin + ray.Direction * (-ray.Origin.Y / ray.Direction.Y)
 
-				controller:BeginTwoFinger(grab)
+				controller:AnchorAt(grab)
 				controller:Pan(Vector2.new(-120, 0))
 				-- A pure sideways pan moves the point by exactly the finger movement.
 				expect(screenPoint(camera, point)).toBeCloseTo(grab + Vector2.new(-120, 0), 0.5)
@@ -118,7 +118,7 @@ return function(t)
 			it("can be inverted so the camera flies with the fingers", function()
 				local _, controller, camera = setup({ invertPan = true })
 				local before = camera.CFrame.Position
-				controller:BeginTwoFinger(CENTER)
+				controller:AnchorAt(CENTER)
 				controller:Pan(Vector2.new(100, 0))
 				expect(camera.CFrame.Position.X).toBeGreaterThan(before.X)
 			end)
@@ -126,7 +126,7 @@ return function(t)
 			it("carries the orbit pivot along", function()
 				local _, controller, camera = setup()
 				local before = camera.CFrame.Position
-				controller:BeginTwoFinger(CENTER)
+				controller:AnchorAt(CENTER)
 				controller:Pan(Vector2.new(70, -40))
 				local pivot = camera.CFrame.Position - before -- the origin, moved with the camera
 
@@ -146,7 +146,7 @@ return function(t)
 				local target = ray.Origin + ray.Direction * (-ray.Origin.Y / ray.Direction.Y)
 				local distance = (target - camera.CFrame.Position).Magnitude
 
-				controller:BeginTwoFinger(pinch)
+				controller:AnchorAt(pinch)
 				controller:Zoom(0.5, pinch)
 				expect((target - camera.CFrame.Position).Magnitude).toBeCloseTo(distance / 2, 1e-3)
 				-- The target stays under the fingers.
@@ -156,7 +156,7 @@ return function(t)
 			it("zooms out with a scale above one", function()
 				local _, controller, camera = setup()
 				local distance = camera.CFrame.Position.Magnitude
-				controller:BeginTwoFinger(CENTER)
+				controller:AnchorAt(CENTER)
 				controller:Zoom(2, CENTER)
 				expect(camera.CFrame.Position.Magnitude).toBeCloseTo(distance * 2, 1e-3)
 			end)
@@ -164,7 +164,7 @@ return function(t)
 			it("respects the zoom sensitivity", function()
 				local _, controller, camera = setup({ zoomSensitivity = 2 })
 				local distance = camera.CFrame.Position.Magnitude
-				controller:BeginTwoFinger(CENTER)
+				controller:AnchorAt(CENTER)
 				controller:Zoom(0.5, CENTER)
 				expect(camera.CFrame.Position.Magnitude).toBeCloseTo(distance / 4, 1e-3)
 			end)
@@ -172,7 +172,7 @@ return function(t)
 			it("flies through surfaces when zooming in very close", function()
 				local _, controller, camera = setup()
 				camera.CFrame = CFrame.lookAt(Vector3.new(0, 10, 0), Vector3.new(0, 0, 0) + Vector3.new(0, 0, -0.001))
-				controller:BeginTwoFinger(CENTER)
+				controller:AnchorAt(CENTER)
 				for _ = 1, 40 do
 					controller:Zoom(0.8, CENTER)
 				end

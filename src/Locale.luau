@@ -13,6 +13,7 @@ local STRINGS = {
 		statusPaused = "Wstrzymany",
 		touchControl = "Sterowanie dotykiem",
 		fingers = "Palce",
+		fingersMouse = "Mysz",
 		gesture = "Gest",
 		noGesture = "brak",
 
@@ -33,11 +34,17 @@ local STRINGS = {
 		gestureDoubleTapHint = "Stuknij dwukrotnie obiekt",
 		gestureLongPress = "Dodaj / usuń z zaznaczenia",
 		gestureLongPressHint = "Przytrzymaj palec na obiekcie",
+		gestureModes = "Pasek trybów (1 palec)",
+		gestureModesHint = "Z lewej: obrót, przesuwanie albo zoom",
+
+		modeRotate = "Obrót",
+		modePan = "Przesuń",
+		modeZoom = "Zoom",
 
 		hudRotate = "Obrót",
 		hudZoom = "Przybliżanie",
 		hudPan = "Przesuwanie",
-		hudBoth = "Przybliżanie + przesuwanie",
+		hudBoth = "Zoom + pan",
 
 		toastSelected = "Zaznaczono: %s",
 		toastAdded = "Dodano: %s",
@@ -48,6 +55,7 @@ local STRINGS = {
 		toastPausedByTool = "Wstrzymano – wybrano inne narzędzie",
 		toastResumed = "Sterowanie dotykiem włączone",
 		toastSelectionItems = "%d obiektów",
+		toastMouseOnly = "Studio podaje dotyk jako mysz – przesuwanie i zoom na pasku z lewej",
 
 		sectionSensitivity = "CZUŁOŚĆ",
 		rotateSpeed = "Obrót",
@@ -74,6 +82,8 @@ local STRINGS = {
 		showTouchesHint = "Kółka pod palcami",
 		mouseInput = "Mysz i rysik",
 		mouseInputHint = "Lewy przycisk działa jak palec",
+		showModeBar = "Pasek trybów",
+		showModeBarHint = "Przesuwanie i zoom jednym palcem",
 		language = "Język",
 		languageAuto = "Auto",
 
@@ -81,6 +91,12 @@ local STRINGS = {
 		touchScreen = "Ekran dotykowy",
 		detected = "wykryty",
 		notDetected = "nie wykryto",
+		diagTouch = "Dotyk",
+		diagTouchValue = "zdarzenia: %d · maks. palców: %d",
+		diagMouse = "Mysz",
+		diagMouseValue = "kliknięcia: %d · ruchy: %d",
+		diagGestures = "Gesty Studio",
+		diagGesturesValue = "pinch: %d · pan: %d · kółko: %d",
 		reset = "Przywróć domyślne",
 	},
 
@@ -91,6 +107,7 @@ local STRINGS = {
 		statusPaused = "Paused",
 		touchControl = "Touch controls",
 		fingers = "Fingers",
+		fingersMouse = "Mouse",
 		gesture = "Gesture",
 		noGesture = "none",
 
@@ -111,6 +128,12 @@ local STRINGS = {
 		gestureDoubleTapHint = "Double-tap an object",
 		gestureLongPress = "Add / remove from selection",
 		gestureLongPressHint = "Press and hold on an object",
+		gestureModes = "Mode bar (1 finger)",
+		gestureModesHint = "On the left: rotate, pan or zoom",
+
+		modeRotate = "Rotate",
+		modePan = "Pan",
+		modeZoom = "Zoom",
 
 		hudRotate = "Rotate",
 		hudZoom = "Zoom",
@@ -126,6 +149,7 @@ local STRINGS = {
 		toastPausedByTool = "Paused – another tool was selected",
 		toastResumed = "Touch controls on",
 		toastSelectionItems = "%d objects",
+		toastMouseOnly = "Studio sends touch as a mouse – pan and zoom on the left bar",
 
 		sectionSensitivity = "SENSITIVITY",
 		rotateSpeed = "Rotate",
@@ -152,6 +176,8 @@ local STRINGS = {
 		showTouchesHint = "Circles under your fingers",
 		mouseInput = "Mouse & pen",
 		mouseInputHint = "Left button acts as a finger",
+		showModeBar = "Mode bar",
+		showModeBarHint = "Pan and zoom with one finger",
 		language = "Language",
 		languageAuto = "Auto",
 
@@ -159,6 +185,12 @@ local STRINGS = {
 		touchScreen = "Touch screen",
 		detected = "detected",
 		notDetected = "not detected",
+		diagTouch = "Touch",
+		diagTouchValue = "events: %d · max fingers: %d",
+		diagMouse = "Mouse",
+		diagMouseValue = "clicks: %d · moves: %d",
+		diagGestures = "Studio gestures",
+		diagGesturesValue = "pinch: %d · pan: %d · wheel: %d",
 		reset = "Reset to defaults",
 	},
 }

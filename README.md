@@ -26,9 +26,24 @@
 | 👆👆 **Podwójne stuknięcie** | Zaznacza obiekt i płynnie ustawia na nim kamerę |
 | ✋ **Przytrzymanie** | Dodaje obiekt do zaznaczenia albo go z niego usuwa |
 
+### Pasek trybów – wszystko jednym palcem
+
+Roblox Studio na Windows zwykle przekazuje pluginom ekran dotykowy **jako mysz**: widzi tylko
+jeden palec, a drugi w ogóle do pluginu nie dociera (to ograniczenie Studio, nie da się go
+obejść z poziomu pluginu). Dlatego przy lewej krawędzi widoku jest **pasek trybów**:
+
+| Tryb | Przeciągnięcie jednym palcem |
+| --- | --- |
+| **Obrót** | obraca kamerę |
+| **Przesuń** | przesuwa widok (pan) |
+| **Zoom** | w górę – przybliża, w dół – oddala (w stronę miejsca, gdzie położysz palec) |
+
+Stuknięcia, podwójne stuknięcia i przytrzymanie działają w każdym trybie. Jeśli Twoje
+urządzenie jednak przekazuje dwa palce, gesty dwoma palcami działają niezależnie od paska.
+
 Dodatkowo:
 
-- **Bezwładność** – po szybkim machnięciu kamera płynnie wyhamowuje.
+- **Bezwładność** – po szybkim machnięciu kamera chwilę jeszcze się przesuwa i płynnie wyhamowuje.
 - **Przelatywanie przez ściany** – przy bardzo bliskim przybliżeniu kamera zaczyna lecieć
   do przodu, więc da się „wejść” do budynku.
 - **Kółka pod palcami** – widać, gdzie Studio rejestruje dotyk, a dwa palce łączy linia.
@@ -49,9 +64,9 @@ widokiem 3D, a sterowanie dotykiem od razu się włączy.
 - Karta **Gesty** – animowana ściąga ze wszystkimi gestami.
 - Karta **Ustawienia** – czułość i opcje (niżej).
 
-| Ustawienia | Zwinięte okno |
+| Ustawienia i diagnostyka | Zwinięte okno |
 | --- | --- |
-| ![Karta ustawień](assets/preview-settings.png) | ![Zwinięte okno](assets/preview-collapsed.png) |
+| ![Karta ustawień z diagnostyką](assets/preview-settings.png) | ![Zwinięte okno](assets/preview-collapsed.png) |
 
 ### Ustawienia
 
@@ -64,7 +79,8 @@ widokiem 3D, a sterowanie dotykiem od razu się włączy.
 | Odwróć obrót / Odwróć przesuwanie | Zmienia kierunek, np. żeby kamera leciała w stronę ruchu palców |
 | Zaznaczaj całe modele | Stuknięcie części modelu zaznacza cały model (jak w Studio); wyłączone – samą część |
 | Pokazuj dotyk | Kółka pod palcami i fala po stuknięciu |
-| Mysz i rysik | Lewy przycisk myszy / rysik działa jak jeden palec (obrót, zaznaczanie) |
+| Mysz i rysik | Lewy przycisk myszy / rysik działa jak jeden palec – **zostaw włączone**, jeśli Studio podaje dotyk jako mysz |
+| Pasek trybów | Pokazuje pasek Obrót / Przesuń / Zoom przy lewej krawędzi |
 | Język | Auto (polski, gdy Studio lub system jest po polsku), PL albo EN |
 
 Wszystkie ustawienia zapisują się w Studio i przetrwają restart.
@@ -98,9 +114,13 @@ Przycisk działa bez ikony. Żeby ją dodać, wgraj [`assets/icon.png`](assets/i
 
 ## Jak to działa i czego się spodziewać
 
-- Plugin potrzebuje urządzenia z ekranem dotykowym, na którym Studio przekazuje dotyk
-  (np. laptop lub tablet z Windows). W **Ustawienia → Diagnostyka** po pierwszym dotyku
-  pojawi się „Ekran dotykowy: **wykryty**”.
+- **Co Studio naprawdę przekazuje** widać w **Ustawienia → Diagnostyka** (liczniki na żywo):
+  - **Dotyk – maks. palców: 2** (na zielono) → Studio podaje prawdziwy multi-touch, działają
+    gesty dwoma palcami.
+  - **Dotyk: 0 zdarzeń**, a rośnie **Mysz** → Studio zamienia dotyk na mysz (jeden palec).
+    W statusie zamiast „Palce” pojawi się „Mysz”. Używaj paska trybów.
+  - **Gesty Studio – pinch** → jeśli Studio zgłasza własny gest szczypania, plugin używa go
+    do zoomu, nawet gdy pojedyncze palce nie docierają.
 - Gdy sterowanie jest aktywne, plugin przejmuje mysz w widoku 3D – jak każde narzędzie Studio.
   Dzięki temu narzędzia Select/Move nie reagują przy okazji na palce (nie przesuniesz
   przypadkiem części). Wybranie innego narzędzia Studio **wstrzymuje** Touch Peak – wróć
@@ -115,7 +135,8 @@ Przycisk działa bez ikony. Żeby ją dodać, wgraj [`assets/icon.png`](assets/i
 
 | Problem | Co zrobić |
 | --- | --- |
-| Kamera nie reaguje na palce, w diagnostyce „nie wykryto” | Studio nie dostaje zdarzeń dotyku na tym urządzeniu. Sprawdź, czy dotyk działa w innych aplikacjach; opcja **Mysz i rysik** pozwala przynajmniej obracać i zaznaczać |
+| Działa tylko jeden palec, szczypanie nic nie robi | Studio podaje dotyk jako mysz (patrz Diagnostyka). Przesuwanie i zoom: pasek trybów z lewej |
+| Kamera w ogóle nie reaguje | Upewnij się, że status to „Aktywny” i że **Mysz i rysik** jest włączone; sprawdź w Diagnostyce, czy rosną liczniki |
 | Status „Wstrzymany” | Wybrano inne narzędzie Studio – włącz ponownie przełącznikiem w oknie |
 | Zoom włącza się zamiast przesuwania (lub odwrotnie) | Na początku gestu przesuwaj palce wyraźniej albo włącz **Zoom i pan razem** |
 | Okno zasłania widok | Zwiń je strzałką albo przeciągnij za nagłówek |

@@ -200,6 +200,149 @@ return function(t)
 			expect(h.app.recognizer:GetTouchCount()).toBe(0)
 		end)
 
+		it("recovers when Studio never reports the mouse release", function()
+			local h = setup()
+			h.app:Open()
+			local mouse = h.world:input("MouseButton1", Vector2.new(300, 300))
+			h.uis.InputBegan:Fire(mouse, false)
+			h.uis.InputChanged:Fire(h.world:input("MouseMovement", Vector2.new(400, 300)), false)
+			-- The release happened outside the viewport: no InputEnded.
+
+			-- The next press still works and starts a fresh drag (no jump from the old position).
+			local before = h.world.camera.CFrame
+			local press = h.world:input("MouseButton1", Vector2.new(800, 300))
+			h.uis.InputBegan:Fire(press, false)
+			h.uis.InputChanged:Fire(h.world:input("MouseMovement", Vector2.new(830, 300)), false)
+			h.uis.InputEnded:Fire(press, false)
+			local turned =
+				math.deg(math.acos(math.clamp(before.LookVector:Dot(h.world.camera.CFrame.LookVector), -1, 1)))
+			expect(turned).toBeGreaterThan(1)
+			expect(turned).toBeLessThan(15) -- 30 px of drag, not the 500 px jump to the old press
+		end)
+
+		it("stops a drag whose button is no longer held", function()
+			local h = setup()
+			h.app:Open()
+			local mouse = h.world:input("MouseButton1", Vector2.new(300, 300))
+			h.uis.InputBegan:Fire(mouse, false)
+			h.uis.InputChanged:Fire(h.world:input("MouseMovement", Vector2.new(400, 300)), false)
+			local cframe = h.world.camera.CFrame
+			h.uis.mouseButton1Pressed = false
+			h.uis.InputChanged:Fire(h.world:input("MouseMovement", Vector2.new(700, 300)), false)
+			expect(h.world.camera.CFrame.Position).toBeCloseTo(cframe.Position)
+			expect(h.app.recognizer:GetTouchCount()).toBe(0)
+		end)
+
+		it("restarts a finger whose InputObject begins again", function()
+			local h = setup()
+			h.app:Open()
+			local finger = h.touchDown(Vector2.new(300, 300))
+			h.touchMove(finger, Vector2.new(360, 300))
+			-- Lost InputEnded, then the same object comes back for a new touch.
+			finger.Position = Vector3.new(900, 300, 0)
+			finger.UserInputState = World.Enum.UserInputState.Begin
+			h.uis.InputBegan:Fire(finger, false)
+			expect(h.app.recognizer:GetTouchCount()).toBe(1)
+			expect(h.app.recognizer:GetMode()).toBe("pending")
+		end)
+
+		it("pans and zooms with one finger from the mode bar", function()
+			local h = setup()
+			h.app:Open()
+			local bar = h.world.coreGui.TouchPeak.TouchPeakModeBar
+			expect(bar.Visible).toBe(true)
+
+			bar.Body.pan.Activated:Fire()
+			local look = h.world.camera.CFrame.LookVector
+			local position = h.world.camera.CFrame.Position
+			local finger = h.touchDown(Vector2.new(600, 400))
+			h.drag(finger, Vector2.new(600, 400), Vector2.new(700, 400))
+			h.touchUp(finger)
+			expect(h.world.camera.CFrame.LookVector).toBeCloseTo(look, 1e-4)
+			expect((h.world.camera.CFrame.Position - position).Magnitude).toBeGreaterThan(1)
+
+			bar.Body.zoom.Activated:Fire()
+			local distance = h.world.camera.CFrame.Position.Magnitude
+			local mouse = h.world:input("MouseButton1", World.ScreenSize / 2)
+			task.wait(0.4) -- past the mouse-after-touch cooldown
+			h.uis.InputBegan:Fire(mouse, false)
+			h.uis.InputChanged:Fire(h.world:input("MouseMovement", World.ScreenSize / 2 - Vector2.new(0, 150)), false)
+			h.uis.InputEnded:Fire(mouse, false)
+			expect(h.world.camera.CFrame.Position.Magnitude).toBeLessThan(distance * 0.8)
+		end)
+
+		it("hides the mode bar when paused or turned off", function()
+			local h = setup()
+			h.app:Open()
+			local bar = h.world.coreGui.TouchPeak.TouchPeakModeBar
+			bar.Body.zoom.Activated:Fire()
+			h.app:SetActive(false)
+			expect(bar.Visible).toBe(false)
+			h.app:SetActive(true)
+			expect(bar.Visible).toBe(true)
+			h.app.settings:Set("showModeBar", false)
+			expect(bar.Visible).toBe(false)
+			expect(h.app.recognizer:GetOneFingerMode()).toBe("rotate")
+		end)
+
+		it("does not move the camera when the mode bar is touched", function()
+			local h = setup()
+			h.app:Open()
+			local before = h.world.camera.CFrame.Position
+			local finger = h.touchDown(Vector2.new(40, 360))
+			h.drag(finger, Vector2.new(40, 360), Vector2.new(400, 360))
+			h.touchUp(finger)
+			expect(h.world.camera.CFrame.Position).toBeCloseTo(before)
+		end)
+
+		it("zooms with Roblox's pinch event when raw fingers are missing", function()
+			local h = setup()
+			h.app:Open()
+			local distance = h.world.camera.CFrame.Position.Magnitude
+			local positions = { Vector2.new(600, 360), Vector2.new(680, 360) }
+			local state = World.Enum.UserInputState
+			h.uis.TouchPinch:Fire(positions, 1, 0, state.Begin, false)
+			h.uis.TouchPinch:Fire(positions, 1.5, 0, state.Change, false)
+			h.uis.TouchPinch:Fire(positions, 2, 0, state.Change, false)
+			h.uis.TouchPinch:Fire(positions, 2, 0, state.End, false)
+			expect(h.world.camera.CFrame.Position.Magnitude).toBeCloseTo(distance / 2, 0.5)
+		end)
+
+		it("shows what Studio delivers in the diagnostics", function()
+			local h = setup()
+			h.app:Open()
+			local a = h.touchDown(Vector2.new(300, 300))
+			local b = h.touchDown(Vector2.new(500, 300))
+			h.touchUp(a)
+			h.touchUp(b)
+			task.wait(0.35)
+			local found = false
+			for _, label in h.world.coreGui.TouchPeak:GetDescendants() do
+				if label:IsA("TextLabel") and label.Text == "events: 4 · max fingers: 2" then
+					found = true
+				end
+			end
+			expect(found).toBe(true)
+		end)
+
+		it("marks a mouse-driven finger and explains it once on touch screens", function()
+			local h = setup()
+			h.app:Open()
+			local mouse = h.world:input("MouseButton1", Vector2.new(300, 300))
+			h.uis.InputBegan:Fire(mouse, false)
+			local chip = h.world.coreGui.TouchPeak.TouchPeakPanel.Body.Content.StatusCard.Chips.Fingers
+			expect(string.find(chip.Text, "Mouse", 1, true) ~= nil).toBe(true)
+			h.uis.InputChanged:Fire(h.world:input("MouseMovement", Vector2.new(400, 300)), false)
+			h.uis.InputEnded:Fire(mouse, false)
+			local hints = 0
+			for _, label in h.world.coreGui.TouchPeak:GetDescendants() do
+				if label:IsA("TextLabel") and string.find(label.Text, "Studio sends touch as a mouse", 1, true) then
+					hints += 1
+				end
+			end
+			expect(hints).toBe(1)
+		end)
+
 		it("ignores the mouse when the option is off", function()
 			local h = setup()
 			h.app.settings:Set("mouseInput", false)

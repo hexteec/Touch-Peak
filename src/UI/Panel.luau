@@ -33,6 +33,7 @@ local GESTURES = {
 	{ icon = "rotate", title = "gestureRotate", hint = "gestureRotateHint" },
 	{ icon = "zoom", title = "gestureZoom", hint = "gestureZoomHint" },
 	{ icon = "pan", title = "gesturePan", hint = "gesturePanHint" },
+	{ icon = "modes", title = "gestureModes", hint = "gestureModesHint" },
 	{ icon = "tap", title = "gestureTap", hint = "gestureTapHint" },
 	{ icon = "doubleTap", title = "gestureDoubleTap", hint = "gestureDoubleTapHint" },
 	{ icon = "longPress", title = "gestureLongPress", hint = "gestureLongPressHint" },
@@ -74,6 +75,7 @@ function Panel.new(params: Params)
 	self._collapsed = false
 	self._active = params.active
 	self._touchCount = 0
+	self._viaMouse = false
 	self._gesture = nil
 	self._drag = nil
 	self._tab = if self._settings:GetState("tab") == "settings" then "settings" else "gestures"
@@ -218,6 +220,7 @@ function Panel:_build()
 			Position = UDim2.fromOffset(14, 38),
 			Size = UDim2.new(1, -84, 0, 22),
 			BackgroundTransparency = 1,
+			ClipsDescendants = true,
 		}, {
 			Create.list(6, Enum.FillDirection.Horizontal),
 			Fingers = fingersChip,
@@ -399,7 +402,7 @@ function Panel:_buildGesturesPage()
 		end
 
 		Create("Frame", {
-			Size = UDim2.new(1, 0, 0, 52),
+			Size = UDim2.new(1, 0, 0, 50),
 			BackgroundColor3 = Color.Surface,
 			LayoutOrder = index,
 			Parent = self._gesturesPage,
@@ -408,23 +411,23 @@ function Panel:_buildGesturesPage()
 			Create.stroke(Color.White, 0.95),
 			IconBox = Create("Frame", {
 				Position = UDim2.fromOffset(7, 7),
-				Size = UDim2.fromOffset(38, 38),
+				Size = UDim2.fromOffset(36, 36),
 				BackgroundColor3 = Color.SurfaceHigh,
 			}, {
 				Create.corner(10),
 				Icon = icon,
 			}),
 			Title = Create("TextLabel", {
-				Position = UDim2.fromOffset(56, 8),
-				Size = UDim2.new(1, -66, 0, 19),
+				Position = UDim2.fromOffset(54, 7),
+				Size = UDim2.new(1, -64, 0, 19),
 				Text = self:_t(gesture.title),
 				FontFace = Font.SemiBold,
 				TextSize = 14,
 				TextTruncate = Enum.TextTruncate.AtEnd,
 			}),
 			Hint = Create("TextLabel", {
-				Position = UDim2.fromOffset(56, 27),
-				Size = UDim2.new(1, -66, 0, 16),
+				Position = UDim2.fromOffset(54, 26),
+				Size = UDim2.new(1, -64, 0, 16),
 				Text = self:_t(gesture.hint),
 				FontFace = Font.Regular,
 				TextSize = 12,
@@ -516,6 +519,7 @@ function Panel:_buildSettingsPage()
 	toggle("selectModels", "selectModels", "selectModelsHint")
 	toggle("showTouches", "showTouches", "showTouchesHint")
 	toggle("mouseInput", "mouseInput", "mouseInputHint")
+	toggle("showModeBar", "showModeBar", "showModeBarHint")
 	choice("language", "language", {
 		{ id = "auto", label = self:_t("languageAuto") },
 		{ id = "pl", label = "PL" },
@@ -526,6 +530,15 @@ function Panel:_buildSettingsPage()
 	local touchChip = Components.Chip(0)
 	add(Components.Row({ title = self:_t("touchScreen"), control = touchChip, controlWidth = 110, layoutOrder = 0 }))
 	self._touchChip = touchChip
+
+	-- Live counters of what Studio actually delivers (touch vs. mouse).
+	self._diagnostics = {}
+	for _, key in { "diagTouch", "diagMouse", "diagGestures" } do
+		local row = Components.Row({ title = self:_t(key), hint = "", layoutOrder = 0 })
+		add(row)
+		self._diagnostics[key] = row.Hint
+	end
+	self:SetInputStats(nil)
 
 	local reset = Components.Button({
 		text = self:_t("reset"),
@@ -739,9 +752,31 @@ function Panel:SetActive(active: boolean, instant: boolean?)
 	self:_updateAnimations()
 end
 
-function Panel:SetTouchCount(count: number)
+-- `viaMouse` is true when the only "finger" is Studio's mouse pointer.
+function Panel:SetTouchCount(count: number, viaMouse: boolean?)
 	self._touchCount = count
+	self._viaMouse = viaMouse == true and count > 0
 	self:_refreshChips()
+end
+
+function Panel:SetInputStats(stats)
+	local s = stats
+		or {
+			touchBegan = 0,
+			touchChanged = 0,
+			touchEnded = 0,
+			touchFingers = 0,
+			mouseDown = 0,
+			mouseMoves = 0,
+			wheel = 0,
+			pinch = 0,
+			pan = 0,
+		}
+	local rows = self._diagnostics
+	rows.diagTouch.Text = self:_t("diagTouchValue", s.touchBegan + s.touchChanged + s.touchEnded, s.touchFingers)
+	rows.diagTouch.TextColor3 = if s.touchFingers >= 2 then Color.Success else Color.TextDim
+	rows.diagMouse.Text = self:_t("diagMouseValue", s.mouseDown, s.mouseMoves)
+	rows.diagGestures.Text = self:_t("diagGesturesValue", s.pinch, s.pan, s.wheel)
 end
 
 function Panel:SetGesture(gesture: string?)
@@ -784,7 +819,9 @@ end
 
 function Panel:_refreshChips()
 	local highlight = '<font color="#EEF1F9">%s</font>'
-	self._fingersChip.Text = self:_t("fingers") .. "  " .. string.format(highlight, tostring(self._touchCount))
+	-- Studio's mouse pointer is shown as such: it can never be more than one finger.
+	local label = self:_t(if self._viaMouse then "fingersMouse" else "fingers")
+	self._fingersChip.Text = label .. "  " .. string.format(highlight, tostring(self._touchCount))
 	self._gestureChip.Text = self:_t("gesture") .. "  " .. string.format(highlight, self._locale:gesture(self._gesture))
 end
 

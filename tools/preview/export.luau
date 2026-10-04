@@ -148,6 +148,34 @@ writeScene(
 	end)
 )
 
+-- Settings tab scrolled to the diagnostics, while a mouse-driven finger pans.
+writeScene(
+	"diagnostics",
+	scene(function(world, app)
+		for _, button in world.coreGui.TouchPeak:GetDescendants() do
+			if button:IsA("TextButton") and button.Text == "Ustawienia" then
+				button.Activated:Fire()
+			end
+		end
+		app.modeBar:SetMode("pan", true)
+		app.panel:SetTouchCount(1, true)
+		app.panel:SetGesture("pan")
+		app.panel:SetInputStats({
+			touchBegan = 0,
+			touchChanged = 0,
+			touchEnded = 0,
+			touchFingers = 0,
+			mouseDown = 14,
+			mouseMoves = 512,
+			wheel = 0,
+			pinch = 0,
+			pan = 0,
+		})
+		world.coreGui.TouchPeak.TouchPeakPanel.Body.Content.Pages.Settings.CanvasPosition = Vector2.new(0, 720)
+		app.overlay:Toast(app.locale:t("toastMouseOnly"))
+	end)
+)
+
 writeScene(
 	"paused",
 	scene(function(_, app)

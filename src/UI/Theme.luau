@@ -38,7 +38,7 @@ Theme.Tween = {
 
 Theme.Size = {
 	PanelWidth = 324,
-	PanelHeight = 600,
+	PanelHeight = 640,
 	CollapsedWidth = 264,
 	Header = 62,
 	Padding = 14,

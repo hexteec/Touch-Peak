@@ -155,4 +155,31 @@ function Icons.longPress()
 	return icon, tweens
 end
 
+-- A tiny mode bar whose highlight steps between its three buttons.
+function Icons.modes()
+	local icon = canvas()
+	Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(14, 30),
+		BackgroundTransparency = 1,
+		Parent = icon,
+	}, {
+		Create.corner(7),
+		Create.stroke(Color.White, 0.7, 1.5),
+	})
+	for _, y in { 0.27, 0.5, 0.73 } do
+		local dot = Create.dot(4, Color.White, UDim2.fromScale(0.5, y))
+		dot.BackgroundTransparency = 0.6
+		dot.Parent = icon
+	end
+	local highlight = Create.dot(8, Color.Accent, UDim2.fromScale(0.5, 0.27))
+	highlight.Parent = icon
+
+	local tweens = {
+		loop(highlight, 1.4, { Position = UDim2.fromScale(0.5, 0.73) }, Enum.EasingStyle.Quint, true),
+	}
+	return icon, tweens
+end
+
 return Icons

@@ -10,6 +10,7 @@
 local CoreGui = game:GetService("CoreGui")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
 
 local Settings = require(script.Parent.Settings)
 local Locale = require(script.Parent.Locale)
@@ -22,6 +23,9 @@ local SelectionController = require(script.Parent.Selection.SelectionController)
 local Theme = require(script.Parent.UI.Theme)
 local Overlay = require(script.Parent.UI.Overlay)
 local Panel = require(script.Parent.UI.Panel)
+local ModeBar = require(script.Parent.UI.ModeBar)
+
+local STATS_REFRESH = 0.25 -- s between diagnostics updates
 
 local App = {}
 App.__index = App
@@ -40,6 +44,9 @@ function App.new(plugin: Plugin)
 	self._open = false
 	self._active = false
 	self._touchDetected = UserInputService.TouchEnabled
+	self._oneFingerMode = "rotate"
+	self._statsScheduled = false
+	self._mouseOnlyHintShown = false
 
 	self.OpenChanged = Signal.new()
 
@@ -52,7 +59,8 @@ function App.new(plugin: Plugin)
 
 	self.input = TouchInput.new(self.recognizer, {
 		isBlocked = function(position)
-			return self.panel ~= nil and self.panel:ContainsPoint(position)
+			return (self.panel ~= nil and self.panel:ContainsPoint(position))
+				or (self.modeBar ~= nil and self.modeBar:ContainsPoint(position))
 		end,
 		mouseEnabled = function()
 			return self.settings:Get("mouseInput")
@@ -85,9 +93,11 @@ function App:Open()
 	end
 	self._open = true
 	self:_ensureGui()
-	-- Opening always shows the full window; it can be collapsed from there.
+	-- Opening always shows the full window (it can be collapsed from there)
+	-- and starts in the default one-finger mode.
 	self.panel:SetCollapsed(false, true)
 	self.panel:SetVisible(true)
+	self:_setOneFingerMode("rotate")
 	self:SetActive(true)
 	self.OpenChanged:Fire(true)
 end
@@ -145,6 +155,22 @@ function App:SetActive(active: boolean)
 		self.panel:SetTouchCount(0)
 		self.panel:SetGesture(nil)
 	end
+	self:_refreshModeBar()
+end
+
+function App:_setOneFingerMode(mode: string)
+	self._oneFingerMode = mode
+	self.recognizer:SetOneFingerMode(mode)
+	if self.modeBar then
+		self.modeBar:SetMode(mode)
+	end
+end
+
+-- The mode bar is only useful while touch controls are running.
+function App:_refreshModeBar()
+	if self.modeBar then
+		self.modeBar:SetVisible(self._open and self._active and self.settings:Get("showModeBar"))
+	end
 end
 
 -- Studio deactivates the plugin when the user picks another tool (Select, Move, ...).
@@ -189,6 +215,19 @@ function App:_ensureGui()
 
 	self.overlay = Overlay.new(gui, self.settings)
 	self:_createPanel()
+	self:_createModeBar()
+end
+
+function App:_createModeBar()
+	self.modeBar = ModeBar.new({
+		parent = self.gui,
+		locale = self.locale,
+		mode = self._oneFingerMode,
+		onModeChanged = function(mode)
+			self:_setOneFingerMode(mode)
+		end,
+	})
+	self:_refreshModeBar()
 end
 
 function App:_createPanel()
@@ -208,6 +247,7 @@ function App:_createPanel()
 			self:Close()
 		end,
 	})
+	self.panel:SetInputStats(self.input.Stats)
 end
 
 -- Rebuilds the window in place (used when the language changes).
@@ -221,9 +261,17 @@ function App:_rebuildPanel()
 	self:_createPanel()
 	self.panel:SetCollapsed(wasCollapsed, true)
 	self.panel:SetVisible(wasVisible, true)
+	if self.modeBar then
+		self.modeBar:Destroy()
+		self:_createModeBar()
+	end
 end
 
 function App:_destroyGui()
+	if self.modeBar then
+		self.modeBar:Destroy()
+		self.modeBar = nil
+	end
 	if self.panel then
 		self.panel:Destroy()
 		self.panel = nil
@@ -278,8 +326,8 @@ function App:_bindGestures()
 	maid:Give(recognizer.RotateEnded:Connect(function(velocity)
 		camera:StartInertia("rotate", velocity)
 	end))
-	maid:Give(recognizer.TwoFingerBegan:Connect(function(centroid)
-		camera:BeginTwoFinger(centroid)
+	maid:Give(recognizer.AnchorBegan:Connect(function(centroid)
+		camera:AnchorAt(centroid)
 	end))
 	maid:Give(recognizer.Pan:Connect(function(delta)
 		camera:Pan(delta)
@@ -288,6 +336,15 @@ function App:_bindGestures()
 		camera:StartInertia("pan", velocity)
 	end))
 	maid:Give(recognizer.Zoom:Connect(function(scale, centroid)
+		camera:Zoom(scale, centroid)
+	end))
+
+	-- Roblox's own pinch event, used only when Studio does not report both fingers.
+	maid:Give(self.input.PinchBegan:Connect(function(centroid)
+		local viewport = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.zero
+		camera:AnchorAt(centroid or viewport / 2)
+	end))
+	maid:Give(self.input.Pinch:Connect(function(scale, centroid)
 		camera:Zoom(scale, centroid)
 	end))
 
@@ -310,12 +367,44 @@ function App:_bindGestures()
 		if self.overlay then
 			self.overlay:ShowGesture(if gesture then self.locale:gesture(gesture) else nil)
 		end
+		if gesture then
+			self:_maybeExplainMouseOnly()
+		end
 	end))
 	maid:Give(recognizer.TouchCountChanged:Connect(function(count)
 		if self.panel then
-			self.panel:SetTouchCount(count)
+			self.panel:SetTouchCount(count, self.input:IsMouseActive())
 		end
 	end))
+
+	-- Diagnostics: refresh the counters a few times per second at most.
+	maid:Give(self.input.StatsChanged:Connect(function()
+		if self._statsScheduled then
+			return
+		end
+		self._statsScheduled = true
+		task.delay(STATS_REFRESH, function()
+			self._statsScheduled = false
+			if self.panel then
+				self.panel:SetInputStats(self.input.Stats)
+			end
+		end)
+	end))
+end
+
+-- On a touch screen where Studio only ever sends mouse events, point the user
+-- at the mode bar once: pinch and two-finger pan cannot work there.
+function App:_maybeExplainMouseOnly()
+	if self._mouseOnlyHintShown or not self.input:IsMouseActive() then
+		return
+	end
+	if not UserInputService.TouchEnabled or self.input.Stats.touchBegan > 0 then
+		return
+	end
+	self._mouseOnlyHintShown = true
+	if self.overlay and self.settings:Get("showModeBar") then
+		self.overlay:Toast(self.locale:t("toastMouseOnly"), Theme.Color.Warning)
+	end
 end
 
 function App:_bindSettings()
@@ -330,6 +419,12 @@ function App:_bindSettings()
 			end)
 		elseif key == "showTouches" and not value and self.overlay then
 			self.overlay:ClearTouches()
+		elseif key == "showModeBar" then
+			if not value then
+				-- Without the bar there is no way back, so fall back to rotating.
+				self:_setOneFingerMode("rotate")
+			end
+			self:_refreshModeBar()
 		end
 	end))
 end

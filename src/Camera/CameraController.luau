@@ -24,7 +24,7 @@ local FOCUS_DURATION = 0.45
 local FOCUS_MARGIN = 1.15
 local MAX_FOCUS_PARTS = 5000
 
-local INERTIA_FRICTION = 5.5 -- 1/s, higher stops sooner
+local INERTIA_FRICTION = 7 -- 1/s; a flick at v px/s coasts another v / 7 px
 local INERTIA_START_SPEED = 80 -- px/s
 local INERTIA_STOP_SPEED = 10 -- px/s
 
@@ -187,14 +187,16 @@ function CameraController:BeginInteraction()
 	self._anchor = nil
 end
 
-function CameraController:BeginTwoFinger(centroid: Vector2)
+-- Starts a pan or zoom: the world point under `screenPosition` becomes the
+-- zoom target and the depth at which panning follows the finger(s).
+function CameraController:AnchorAt(screenPosition: Vector2)
 	self._inertia = nil
 	self._focus = nil
 	local camera = self:_camera()
 	if not camera then
 		return
 	end
-	self._anchor = self:_findAnchor(camera, centroid, self:_getPivot(camera))
+	self._anchor = self:_findAnchor(camera, screenPosition, self:_getPivot(camera))
 end
 
 function CameraController:Rotate(delta: Vector2)
