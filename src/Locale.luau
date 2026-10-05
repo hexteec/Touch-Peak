@@ -25,10 +25,6 @@ local STRINGS = {
 		effTap = "zaznacza obiekt",
 		actDoubleTap = "Stuknij dwa razy",
 		effDoubleTap = "ustawia kamerę na obiekcie",
-		actHold = "Przytrzymaj",
-		effHold = "dodaje do zaznaczenia albo usuwa",
-		actTwoFingers = "Dwa palce",
-		effTwoFingers = "zoom i przesuwanie, gdy Studio je widzi",
 
 		hudRotate = "Obrót",
 		hudZoom = "Zoom",
@@ -37,8 +33,6 @@ local STRINGS = {
 		noGesture = "brak",
 
 		toastSelected = "Zaznaczono: %s",
-		toastAdded = "Dodano: %s",
-		toastRemoved = "Odznaczono: %s",
 		toastCleared = "Zaznaczenie wyczyszczone",
 		toastFocused = "Kamera na: %s",
 		toastNothingToFocus = "Stuknij dwa razy w obiekt, żeby go pokazać",
@@ -62,8 +56,6 @@ local STRINGS = {
 		invertRotateHint = "Kamera kręci się w drugą stronę",
 		invertPan = "Odwróć przesuwanie",
 		invertPanHint = "Kamera leci tam, gdzie palec",
-		combineGestures = "Zoom i przesuwanie naraz",
-		combineGesturesHint = "Przy gestach dwoma palcami",
 
 		groupZoom = "Suwak zoomu",
 		showZoomStrip = "Pokazuj suwak",
@@ -118,10 +110,6 @@ local STRINGS = {
 		effTap = "selects an object",
 		actDoubleTap = "Double-tap",
 		effDoubleTap = "frames the object",
-		actHold = "Press and hold",
-		effHold = "adds to or removes from the selection",
-		actTwoFingers = "Two fingers",
-		effTwoFingers = "zoom and pan, when Studio sees both",
 
 		hudRotate = "Rotate",
 		hudZoom = "Zoom",
@@ -130,8 +118,6 @@ local STRINGS = {
 		noGesture = "none",
 
 		toastSelected = "Selected: %s",
-		toastAdded = "Added: %s",
-		toastRemoved = "Removed: %s",
 		toastCleared = "Selection cleared",
 		toastFocused = "Framed: %s",
 		toastNothingToFocus = "Double-tap an object to frame it",
@@ -155,8 +141,6 @@ local STRINGS = {
 		invertRotateHint = "The camera turns the other way",
 		invertPan = "Invert pan",
 		invertPanHint = "The camera moves with your finger",
-		combineGestures = "Zoom and pan together",
-		combineGesturesHint = "For two-finger gestures",
 
 		groupZoom = "Zoom slider",
 		showZoomStrip = "Show slider",

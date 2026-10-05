@@ -108,7 +108,7 @@ return function(t)
 			h.panel:SetCollapsed(false)
 			expect(find(h.gui, "Content").Visible).toBe(true)
 			expect(find(h.gui, "Status").Visible).toBe(true)
-			expect(root.Size.Y.Offset).toBeGreaterThan(400)
+			expect(root.Size.Y.Offset).toBe(400)
 		end)
 
 		it("collapses from the chevron button and closes from the X", function()
@@ -119,6 +119,74 @@ return function(t)
 			expect(h.panel:IsCollapsed()).toBe(true)
 			header.Close.Activated:Fire()
 			expect(h.calls.close).toBe(1)
+		end)
+
+		it("lists only the gestures that work", function()
+			local h = setup()
+			local actions = {}
+			for _, row in find(h.gui, "Pages").Gestures:GetChildren() do
+				if row:FindFirstChild("Action") then
+					table.insert(actions, row.Action.Text)
+				end
+			end
+			table.sort(actions)
+			expect(table.concat(actions, ", ")).toBe(
+				"Przeciągnij, Stuknij, Stuknij dwa razy, Stuknij i przeciągnij, Suwak przy krawędzi"
+			)
+		end)
+
+		it("collapses into a pill with the icon and the on/off switch", function()
+			local h = setup()
+			h.panel:SetVisible(true)
+			local root = find(h.gui, "TouchPeakPanel")
+			local right = root.Position.X.Offset + root.Size.X.Offset
+			h.panel:SetCollapsed(true, true)
+
+			expect(root.Size.X.Offset).toBe(104)
+			expect(root.Size.Y.Offset).toBe(46)
+			-- It stays tucked against the same (right) edge.
+			expect(root.Position.X.Offset + root.Size.X.Offset).toBe(right)
+			local pill = find(h.gui, "Pill")
+			expect(pill.Visible).toBe(true)
+			expect(find(h.gui, "Header").Visible).toBe(false)
+
+			pill.Switch.Activated:Fire()
+			expect(h.calls.active[1]).toBe(false)
+			h.panel:SetActive(false)
+			expect(find(h.gui, "Status").Switch.Knob.Position.X.Offset).toBe(3)
+
+			-- Tapping the icon opens the window again.
+			local touch = h.world:input("Touch", Vector2.new(1200, 40))
+			pill.Handle.InputBegan:Fire(touch)
+			h.world.userInputService.InputEnded:Fire(touch)
+			expect(h.panel:IsCollapsed()).toBe(false)
+			expect(root.Position.X.Offset + root.Size.X.Offset).toBe(right)
+		end)
+
+		it("uses your image from Config.Icon", function()
+			local world = World.new()
+			world:require("Config").Icon = "rbxassetid://1234567890"
+			local Panel = world:require("UI/Panel")
+			local gui = world.newInstance("ScreenGui")
+			gui.Parent = world.coreGui
+			local panel = Panel.new({
+				parent = gui,
+				settings = world:require("Settings").new(nil),
+				locale = world:require("Locale").new("pl"),
+				active = true,
+				touchDetected = false,
+				onActiveChanged = function() end,
+				onClose = function() end,
+			})
+			local images = 0
+			for _, descendant in gui:GetDescendants() do
+				if descendant:IsA("ImageLabel") and descendant.Image == "rbxassetid://1234567890" then
+					images += 1
+					expect(descendant.Light.BackgroundColor3).toBe(world:require("UI/Theme").Color.Green)
+				end
+			end
+			expect(images).toBe(2) -- header and collapsed pill
+			panel:SetActive(false)
 		end)
 
 		it("reports clicks on the on/off switch", function()
@@ -291,7 +359,7 @@ return function(t)
 		it("builds every legend glyph", function()
 			local world = World.new()
 			local Icons = world:require("UI/GestureIcons")
-			for _, name in { "drag", "tapDrag", "strip", "tap", "doubleTap", "hold", "twoFingers" } do
+			for _, name in { "drag", "tapDrag", "strip", "tap", "doubleTap" } do
 				expect(Icons[name]():IsA("Frame")).toBe(true)
 			end
 		end)

@@ -36,8 +36,6 @@ local LEGEND = {
 	{ icon = "strip", action = "actStrip", effect = "effStrip", color = Color.Blue },
 	{ icon = "tap", action = "actTap", effect = "effTap" },
 	{ icon = "doubleTap", action = "actDoubleTap", effect = "effDoubleTap" },
-	{ icon = "hold", action = "actHold", effect = "effHold" },
-	{ icon = "twoFingers", action = "actTwoFingers", effect = "effTwoFingers" },
 }
 
 local EMPTY_STATS = {
@@ -68,7 +66,7 @@ local function hex(color: Color3): string
 	return string.format("#%02X%02X%02X", byte(color.R), byte(color.G), byte(color.B))
 end
 
--- The logo: two peaks, the front one with a light on its summit.
+-- The drawn logo: two peaks, the front one with a light on its summit.
 local function peakLogo(): (Frame, Frame)
 	-- Bars of a peak: `length` long at 60 degrees, meeting at `apex`.
 	local function peak(apex: Vector2, length: number, color: Color3)
@@ -81,8 +79,6 @@ local function peakLogo(): (Frame, Frame)
 	local summit = Create.dot(5, Color.Green, UDim2.fromOffset(9, 0))
 
 	local logo = Create("Frame", {
-		AnchorPoint = Vector2.new(0, 0.5),
-		Position = UDim2.new(0, Size.Inset, 0.5, 1),
 		Size = UDim2.fromOffset(24, 16),
 		BackgroundTransparency = 1,
 	}, {
@@ -97,6 +93,31 @@ local function peakLogo(): (Frame, Frame)
 	end
 	summit.ZIndex = 3
 	return logo, summit
+end
+
+-- The plugin's icon: your image from Config.Icon with a status light in its
+-- corner, or the drawn peaks (whose summit is the light) when none is set.
+local function makeIcon(size: number): (GuiObject, Frame)
+	if Config.Icon == "" then
+		local logo, summit = peakLogo()
+		logo.AnchorPoint = Vector2.new(0, 0.5)
+		return logo, summit
+	end
+
+	local light = Create.dot(8, Color.Green, UDim2.new(1, -1, 1, -1))
+	light.ZIndex = 3
+	Create.stroke(Color.Graphite, 0, 2).Parent = light
+	local icon = Create("ImageLabel", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Size = UDim2.fromOffset(size, size),
+		BackgroundTransparency = 1,
+		Image = Config.Icon,
+		ScaleType = Enum.ScaleType.Fit,
+	}, {
+		Create.corner(6),
+		Light = light,
+	})
+	return icon, light
 end
 
 local Panel = {}
@@ -121,8 +142,9 @@ function Panel.new(params: Params)
 	self._controls = {}
 	self._visible = false
 	self._visibleToken = 0
-	self._collapseToken = 0
 	self._collapsed = false
+	self._lights = {}
+	self._rightReserve = 0
 	self._active = params.active
 	self._gesture = nil
 	self._inputSource = nil
@@ -165,10 +187,10 @@ function Panel:_build()
 	local inset = Size.Inset
 
 	-- Header: logo, wordmark, collapse, close.
-	local logo, summit = peakLogo()
-	local chevron = Components.ChevronGlyph()
+	local logo, headerLight = makeIcon(24)
+	logo.Position = UDim2.new(0, inset, 0.5, 1)
 	local collapseButton = Components.IconButton({
-		glyph = chevron,
+		glyph = Components.ChevronGlyph(),
 		onActivated = function()
 			self:SetCollapsed(not self._collapsed)
 		end,
@@ -184,7 +206,7 @@ function Panel:_build()
 
 	local dragHandle = Create("TextButton", {
 		Size = UDim2.new(1, -HEADER_BUTTONS_WIDTH, 1, 0),
-		ZIndex = 2,
+		ZIndex = 4,
 	})
 
 	local header = Create("Frame", {
@@ -290,17 +312,43 @@ function Panel:_build()
 		Pages = pages,
 	})
 
+	-- Collapsed: just the icon (tap to open, drag to move) and the on/off switch.
+	local pillIcon, pillLight = makeIcon(26)
+	pillIcon.Position = UDim2.new(0, 14, 0.5, if Config.Icon == "" then 1 else 0)
+	local pillSwitch = Components.Switch({
+		value = self._active,
+		onChanged = function(value)
+			self._params.onActiveChanged(value)
+		end,
+	})
+	pillSwitch.instance.Position = UDim2.new(1, -12, 0.5, 0)
+	local pillHandle = Create("TextButton", {
+		Size = UDim2.new(1, -60, 1, 0),
+		ZIndex = 4,
+	})
+	local pill = Create("Frame", {
+		Size = UDim2.new(1, 0, 0, Size.Header),
+		BackgroundTransparency = 1,
+		Visible = false,
+	}, {
+		Icon = pillIcon,
+		Switch = pillSwitch.instance,
+		Handle = pillHandle,
+	})
+
+	local corner = Create.corner(Radius.Panel)
 	local body = Create("Frame", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundColor3 = Color.Graphite,
 		ClipsDescendants = true,
 		ZIndex = 2,
 	}, {
-		Create.corner(Radius.Panel),
+		Corner = corner,
 		Create.stroke(Color.Bone, 0.9),
 		Header = header,
 		Status = status,
 		Content = content,
+		Pill = pill,
 	})
 
 	local scale = Create("UIScale", { Scale = 1 })
@@ -315,8 +363,11 @@ function Panel:_build()
 		Body = body,
 	})
 
+	self._shadowCorners = {}
 	for index, layer in { { 2, 0.8 }, { 12, 0.92 } } do
 		local spread, transparency = layer[1], layer[2]
+		local shadowCorner = Create.corner(Radius.Panel + spread / 2)
+		self._shadowCorners[shadowCorner] = spread
 		Create("Frame", {
 			AnchorPoint = Vector2.new(0.5, 0.5),
 			Position = UDim2.new(0.5, 0, 0.5, 2 + index * 2),
@@ -325,7 +376,7 @@ function Panel:_build()
 			BackgroundTransparency = transparency,
 			ZIndex = 1,
 			Parent = root,
-		}, { Create.corner(Radius.Panel + spread / 2) })
+		}, { shadowCorner })
 	end
 
 	root.Parent = self._params.parent
@@ -334,13 +385,15 @@ function Panel:_build()
 	self._root = root
 	self._scale = scale
 	self._body = body
+	self._header = header
 	self._status = status
 	self._content = content
-	self._chevron = chevron
-	self._dragHandle = dragHandle
-	self._summit = summit
+	self._pill = pill
+	self._corner = corner
+	self._dragHandles = { dragHandle, pillHandle }
+	self._lights = { headerLight, pillLight }
 	self._statusLabel = statusLabel
-	self._switch = switch
+	self._switches = { switch, pillSwitch }
 	self._tabs = tabs
 	self._legendPage = legendPage
 	self._settingsPage = settingsPage
@@ -451,7 +504,6 @@ function Panel:_buildSettings()
 	switch("inertia", "inertia", "inertiaHint")
 	switch("invertRotate", "invertRotate", "invertRotateHint")
 	switch("invertPan", "invertPan", "invertPanHint")
-	switch("combineGestures", "combineGestures", "combineGesturesHint")
 
 	group("groupZoom")
 	switch("showZoomStrip", "showZoomStrip", "showZoomStripHint")
@@ -504,18 +556,21 @@ end
 -- Dragging -----------------------------------------------------------------------
 
 function Panel:_bindDrag()
-	self._maid:Give(self._dragHandle.InputBegan:Connect(function(input)
-		if self._drag or not isPointer(input) then
-			return
-		end
-		self._drag = {
-			input = input,
-			isTouch = input.UserInputType == Enum.UserInputType.Touch,
-			start = toVector2(input.Position),
-			origin = self._position,
-			moved = false,
-		}
-	end))
+	-- Both the header and the collapsed pill's icon move the window.
+	for _, handle in self._dragHandles do
+		self._maid:Give(handle.InputBegan:Connect(function(input)
+			if self._drag or not isPointer(input) then
+				return
+			end
+			self._drag = {
+				input = input,
+				isTouch = input.UserInputType == Enum.UserInputType.Touch,
+				start = toVector2(input.Position),
+				origin = self._position,
+				moved = false,
+			}
+		end))
+	end
 
 	self._maid:Give(UserInputService.InputChanged:Connect(function(input)
 		local drag = self._drag
@@ -556,7 +611,7 @@ function Panel:_bindDrag()
 			self._customPosition = true
 			self._settings:SetState("position", { x = self._position.X, y = self._position.Y })
 		elseif self._collapsed then
-			-- A plain tap on the collapsed header opens the window again.
+			-- A plain tap on the collapsed pill opens the window again.
 			self:SetCollapsed(false)
 		end
 	end))
@@ -575,7 +630,7 @@ end
 
 function Panel:_targetSize(): Vector2
 	if self._collapsed then
-		return Vector2.new(Size.CollapsedWidth, Size.Header)
+		return Vector2.new(Size.PillWidth, Size.Header)
 	end
 	return Vector2.new(Size.PanelWidth, self:_expandedHeight())
 end
@@ -588,9 +643,20 @@ function Panel:_clamp(position: Vector2, size: Vector2): Vector2
 	return Vector2.new(math.clamp(position.X, margin, maxX), math.clamp(position.Y, margin, maxY))
 end
 
--- Until the user drags the window it lives in the top-right corner of the viewport.
+-- Until the user drags the window it lives in the top-right corner of the
+-- viewport, left of anything reserved along the right edge (the zoom strip).
 function Panel:_defaultPosition(): Vector2
-	return Vector2.new(self:_screenSize().X - Size.PanelWidth - 20, 20)
+	local width = self:_targetSize().X
+	return Vector2.new(self:_screenSize().X - width - 20 - self._rightReserve, 20)
+end
+
+-- Keeps the default position clear of `pixels` along the right edge of the screen.
+function Panel:SetRightReserve(pixels: number)
+	self._rightReserve = pixels
+	if not self._customPosition then
+		self._position = self:_defaultPosition()
+		self:_applyLayout(true)
+	end
 end
 
 function Panel:_restorePosition()
@@ -669,27 +735,25 @@ function Panel:SetVisible(visible: boolean, instant: boolean?)
 end
 
 function Panel:SetCollapsed(collapsed: boolean, instant: boolean?)
+	local before = self:_targetSize()
 	self._collapsed = collapsed
-	self._collapseToken += 1
+	local after = self:_targetSize()
+
+	-- A window on the right half of the screen shrinks toward its right edge.
+	if self._position.X + before.X / 2 > self:_screenSize().X / 2 then
+		self._position += Vector2.new(before.X - after.X, 0)
+	end
+
+	self._header.Visible = not collapsed
+	self._status.Visible = not collapsed
+	self._content.Visible = not collapsed
+	self._pill.Visible = collapsed
+
 	local info = if instant then nil else Theme.Tween.Smooth
-
-	Create.animate(self._chevron, info, { Rotation = if collapsed then 180 else 0 })
-
-	if not collapsed then
-		self._content.Visible = true
-		self._status.Visible = true
-	elseif instant then
-		self._content.Visible = false
-		self._status.Visible = false
-	else
-		-- Hide the content (and its inputs) once the window has shrunk.
-		local token = self._collapseToken
-		task.delay(Theme.Tween.Smooth.Time, function()
-			if token == self._collapseToken then
-				self._content.Visible = false
-				self._status.Visible = false
-			end
-		end)
+	local radius = if collapsed then Size.Header / 2 else Radius.Panel
+	Create.animate(self._corner, info, { CornerRadius = UDim.new(0, radius) })
+	for shadowCorner, spread in self._shadowCorners do
+		Create.animate(shadowCorner, info, { CornerRadius = UDim.new(0, radius + spread / 2) })
 	end
 
 	self:_applyLayout(instant)
@@ -697,7 +761,9 @@ end
 
 function Panel:SetActive(active: boolean, instant: boolean?)
 	self._active = active
-	self._switch.set(active, instant)
+	for _, switch in self._switches do
+		switch.set(active, instant)
+	end
 	self:_refreshStatus()
 end
 
@@ -750,7 +816,9 @@ end
 
 function Panel:_refreshStatus()
 	local active = self._active
-	self._summit.BackgroundColor3 = if active then Color.Green else Color.Amber
+	for _, light in self._lights do
+		light.BackgroundColor3 = if active then Color.Green else Color.Amber
+	end
 
 	local text = self:_t(if active then "statusOn" else "statusPaused")
 	self._statusLabel.TextColor3 = if active then Color.Bone else Color.Amber

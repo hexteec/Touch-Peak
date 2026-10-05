@@ -169,9 +169,16 @@ end
 -- The zoom strip is only useful while touch controls are running.
 function App:_refreshZoomStrip()
 	local strip = self.zoomStrip
-	if strip then
-		strip:SetSide(self.settings:Get("zoomSide"))
-		strip:SetVisible(self._open and self._active and self.settings:Get("showZoomStrip"))
+	if not strip then
+		return
+	end
+	local side = self.settings:Get("zoomSide")
+	local shown = self.settings:Get("showZoomStrip")
+	strip:SetSide(side)
+	strip:SetVisible(self._open and self._active and shown)
+	-- Keep the window's default spot clear of a strip on the right edge.
+	if self.panel then
+		self.panel:SetRightReserve(if shown and side == "right" then strip:GetFootprint() else 0)
 	end
 end
 
@@ -382,9 +389,6 @@ function App:_bindGestures()
 	maid:Give(recognizer.DoubleTap:Connect(function(position)
 		self:_onDoubleTap(position)
 	end))
-	maid:Give(recognizer.LongPress:Connect(function(position)
-		self:_onLongPress(position)
-	end))
 	maid:Give(recognizer.TapDragBegan:Connect(function()
 		self:_undoTapSelection()
 	end))
@@ -492,17 +496,6 @@ function App:_onDoubleTap(position: Vector2)
 	else
 		overlay:Toast(self.locale:t("toastNothingToFocus"), Theme.Color.Ash)
 	end
-end
-
-function App:_onLongPress(position: Vector2)
-	local target, added = self.selection:ToggleAt(position)
-	local overlay = self.overlay
-	if not overlay or not target then
-		return
-	end
-	overlay:Ripple(position)
-	local key = if added then "toastAdded" else "toastRemoved"
-	overlay:Toast(self.locale:t(key, target.Name), if added then Theme.Color.Bone else Theme.Color.Ash)
 end
 
 return App

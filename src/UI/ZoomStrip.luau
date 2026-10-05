@@ -251,6 +251,11 @@ function ZoomStrip:IsVisible(): boolean
 	return self._root.Visible
 end
 
+-- Horizontal space the strip takes up at its screen edge, gap included.
+function ZoomStrip:GetFootprint(): number
+	return WIDTH + EDGE_GAP
+end
+
 function ZoomStrip:IsHeld(): boolean
 	return self._tracking ~= nil
 end

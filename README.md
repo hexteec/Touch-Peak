@@ -17,11 +17,9 @@
 | --- | --- |
 | Przeciągnij jednym palcem | Kamera obraca się wokół punktu na środku ekranu (albo w miejscu) |
 | Stuknij, potem od razu przeciągnij | Widok przesuwa się za palcem |
-| Przesuń palcem po suwaku przy krawędzi | W górę przybliża, w dół oddala |
+| Przesuń palcem po suwaku przy prawej krawędzi | W górę przybliża, w dół oddala |
 | Stuknij | Zaznacza obiekt; stuknięcie w pustkę czyści zaznaczenie |
 | Stuknij dwa razy | Kamera płynnie ustawia się na obiekcie |
-| Przytrzymaj | Dodaje obiekt do zaznaczenia albo go usuwa |
-| Dwa palce | Rozsunięcie przybliża, ruch w jedną stronę przesuwa (gdy Studio widzi oba palce) |
 
 Kolory w oknie odpowiadają uchwytom osi w Studio: obrót jest zielony, przesuwanie czerwone,
 zoom niebieski. Pierścień pod palcem przybiera kolor ruchu, który właśnie wykonujesz.
@@ -35,14 +33,13 @@ zaznaczenia.
 
 Przycisk **Touch Peak** na karcie **Plugins** otwiera okno i włącza sterowanie.
 
-- Lampka na szczycie logo: zielona, gdy sterowanie jest włączone, bursztynowa, gdy wstrzymane.
-  Widać ją także w zwiniętym oknie.
+- Lampka przy ikonie: zielona, gdy sterowanie jest włączone, bursztynowa, gdy wstrzymane.
 - Przełącznik obok napisu „Włączony” wstrzymuje i wznawia sterowanie.
-- Przeciągnij nagłówek, żeby przesunąć okno; strzałka je zwija, a stuknięcie w zwinięty
-  nagłówek rozwija.
+- Przeciągnij nagłówek, żeby przesunąć okno. Strzałka zwija je do małej pigułki z samą ikoną i
+  przełącznikiem; pigułkę też można przeciągać, a stuknięcie w ikonę rozwija okno.
 - Karta **Gesty** to ściąga, karta **Ustawienia** to opcje i diagnostyka.
 
-| Ustawienia i diagnostyka | Zwinięte okno |
+| Ustawienia i diagnostyka | Zwinięte okno (pigułka) |
 | --- | --- |
 | ![Ustawienia z diagnostyką](assets/preview-settings.png) | ![Zwinięte okno](assets/preview-collapsed.png) |
 
@@ -54,8 +51,7 @@ Przycisk **Touch Peak** na karcie **Plugins** otwiera okno i włącza sterowanie
 | Obrót | **Orbita** wokół punktu, na który patrzysz, albo **W miejscu** (jak prawy przycisk myszy w Studio) |
 | Bezwładność | Kamera wyhamowuje po szybkim machnięciu |
 | Odwróć obrót, Odwróć przesuwanie | Zmieniają kierunek ruchu |
-| Zoom i przesuwanie naraz | Gest dwoma palcami robi oba ruchy jednocześnie |
-| Suwak zoomu | Pokazuje suwak i wybiera stronę ekranu: lewą albo prawą |
+| Suwak zoomu | Pokazuje suwak i wybiera stronę ekranu (domyślnie prawa) |
 | Zaznaczaj całe modele | Stuknięcie części zaznacza cały model, jak kliknięcie w Studio |
 | Pokazuj dotyk | Pierścienie pod palcami |
 | Mysz i rysik | Lewy przycisk działa jak palec; zostaw włączone, gdy Studio widzi dotyk jako mysz |
@@ -92,8 +88,10 @@ Studio ponownie.
    opublikuj. Potem w Creator Hub (create.roblox.com, **Creations → Plugins**) ustaw ikonę i
    włącz udostępnianie w Creator Store. Kolejną wersję publikujesz tak samo, wybierając w tym
    oknie istniejący plugin, żeby go zaktualizować zamiast tworzyć nowy.
-5. Ikona przycisku na pasku jest opcjonalna: wgraj [`assets/icon.png`](assets/icon.png) jako
-   Decal, wklej `rbxassetid://<id>` do `ToolbarIcon` w module **Config** i opublikuj ponownie.
+5. Własna ikona: wgraj obrazek przez **View → Asset Manager → Bulk Import**, kliknij go prawym
+   przyciskiem → **Copy ID** i wklej jako `Icon = "rbxassetid://<id>"` w module **Config**. Pojawi
+   się obok „touch peak”, w zwiniętej pigułce i na przycisku na pasku. Bez niej okno rysuje
+   własny znak szczytu. Możesz użyć [`assets/icon.png`](assets/icon.png).
 
 Zmiany zrobione w Studio nie trafiają same do repozytorium. Jeśli wolisz pisać kod w plikach z
 `src/` i mieć go w Studio na żywo, użyj [Rojo](https://rojo.space): `rojo serve place.project.json`
@@ -104,10 +102,9 @@ i wtyczka Rojo w Studio zsynchronizują `src/` z **ServerStorage → TouchPeak**
 
 | Objaw | Co zrobić |
 | --- | --- |
-| Szczypanie dwoma palcami nic nie robi | Studio widzi dotyk jako mysz (Diagnostyka: „Ostatnie wejście: mysz”). Używaj suwaka i stuknij-i-przeciągnij |
 | Kamera w ogóle nie reaguje | Sprawdź, czy lampka jest zielona i czy **Mysz i rysik** jest włączone; w Diagnostyce powinny rosnąć liczniki |
 | Lampka zrobiła się bursztynowa | Wybrano inne narzędzie Studio; włącz sterowanie przełącznikiem w oknie |
-| Okno albo suwak zasłania widok | Zwiń okno, przeciągnij je albo przenieś suwak na drugą stronę w Ustawieniach |
+| Okno albo suwak zasłania widok | Zwiń okno do pigułki, przeciągnij je albo przenieś suwak na drugą stronę w Ustawieniach |
 
 Podczas pracy plugin przejmuje mysz w widoku 3D, tak jak każde narzędzie Studio, żeby
 narzędzia Select i Move nie przesuwały przy okazji części pod palcem. Działa tylko w trybie

@@ -87,19 +87,4 @@ function Icons.doubleTap()
 	return icon
 end
 
-function Icons.hold()
-	local icon = canvas()
-	Create.ring(20, Color.Bone, 0.2, 2).Parent = icon
-	Create.dot(10, Color.Bone).Parent = icon
-	return icon
-end
-
-function Icons.twoFingers()
-	local icon = canvas()
-	line(Vector2.new(-6, 6), Vector2.new(6, -6), Color.Bone, 0.7).Parent = icon
-	Create.dot(7, Color.Bone, at(-7, 7)).Parent = icon
-	Create.dot(7, Color.Bone, at(7, -7)).Parent = icon
-	return icon
-end
-
 return Icons

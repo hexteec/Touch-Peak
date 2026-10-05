@@ -56,8 +56,8 @@ Theme.Radius = {
 
 Theme.Size = {
 	PanelWidth = 312,
-	PanelHeight = 500,
-	CollapsedWidth = 232,
+	PanelHeight = 400,
+	PillWidth = 104, -- collapsed: icon and on/off switch
 	Header = 46,
 	Status = 34,
 	Tabs = 40,

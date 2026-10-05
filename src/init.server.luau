@@ -22,8 +22,7 @@ local App = require(script.App)
 local app = App.new(plugin)
 
 local toolbar = plugin:CreateToolbar(Config.ToolbarName)
-local button =
-	toolbar:CreateButton(Config.ButtonId, app.locale:t("buttonTooltip"), Config.ToolbarIcon, Config.ButtonText)
+local button = toolbar:CreateButton(Config.ButtonId, app.locale:t("buttonTooltip"), Config.Icon, Config.ButtonText)
 button.ClickableWhenViewportHidden = true
 
 button.Click:Connect(function()

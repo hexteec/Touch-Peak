@@ -22,7 +22,7 @@ local DEFAULTS = {
 	showTouches = true,
 	mouseInput = true,
 	showZoomStrip = true,
-	zoomSide = "left", -- which edge of the viewport the zoom strip sits on
+	zoomSide = "right", -- which edge of the viewport the zoom strip sits on
 	language = "auto", -- "auto" | "pl" | "en"
 }
 
