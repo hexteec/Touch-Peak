@@ -1,0 +1,4673 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<Item class="ServerStorage" referent="RBX0">
+		<Properties>
+			<string name="Name">ServerStorage</string>
+		</Properties>
+		<Item class="Script" referent="RBX1">
+			<Properties>
+				<string name="Name">TouchPeak</string>
+				<ProtectedString name="Source"><![CDATA[--[[
+	Touch Peak – touch controls for the Roblox Studio camera.
+
+	  1 finger ............ rotate the camera
+	  2 fingers apart ..... zoom
+	  2 fingers together .. pan
+	  tap ................. select
+	  double tap .......... focus the camera on an object
+	  press and hold ...... add to / remove from the selection
+]]
+
+local RunService = game:GetService("RunService")
+
+-- Plugins also run inside Play Solo sessions; only the edit session needs us.
+if not plugin or not RunService:IsEdit() then
+	return
+end
+
+local Config = require(script.Config)
+local App = require(script.App)
+
+local app = App.new(plugin)
+
+local toolbar = plugin:CreateToolbar(Config.ToolbarName)
+local button =
+	toolbar:CreateButton(Config.ButtonId, app.locale:t("buttonTooltip"), Config.ToolbarIcon, Config.ButtonText)
+button.ClickableWhenViewportHidden = true
+
+button.Click:Connect(function()
+	app:Toggle()
+end)
+
+app.OpenChanged:Connect(function(open)
+	button:SetActive(open)
+end)
+
+plugin.Deactivation:Connect(function()
+	app:OnPluginDeactivated()
+end)
+
+plugin.Unloading:Connect(function()
+	app:Destroy()
+end)
+]]></ProtectedString>
+			</Properties>
+			<Item class="ModuleScript" referent="RBX2">
+				<Properties>
+					<string name="Name">App</string>
+					<ProtectedString name="Source"><![CDATA[--[[
+	Wires everything together: settings, input, gestures, camera, selection
+	and the on-screen UI.
+
+	"Open" means the window is shown; "active" means touch controls are
+	running (and the plugin holds Studio's mouse, so Studio's own select/drag
+	tool does not also react to fingers). Opening the plugin activates it.
+]]
+
+local CoreGui = game:GetService("CoreGui")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local Settings = require(script.Parent.Settings)
+local Locale = require(script.Parent.Locale)
+local Signal = require(script.Parent.Util.Signal)
+local Maid = require(script.Parent.Util.Maid)
+local GestureRecognizer = require(script.Parent.Input.GestureRecognizer)
+local TouchInput = require(script.Parent.Input.TouchInput)
+local CameraController = require(script.Parent.Camera.CameraController)
+local SelectionController = require(script.Parent.Selection.SelectionController)
+local Theme = require(script.Parent.UI.Theme)
+local Overlay = require(script.Parent.UI.Overlay)
+local Panel = require(script.Parent.UI.Panel)
+local ZoomStrip = require(script.Parent.UI.ZoomStrip)
+
+local STATS_REFRESH = 0.25 -- s between diagnostics updates
+-- A tap followed by a drag is a zoom, not a selection: undo the tap's selection
+-- if the drag starts within this time.
+local TAP_UNDO_WINDOW = 1
+-- Zoom strip: dragging this many pixels changes the distance to the target e times.
+local STRIP_PIXELS_PER_E = 160
+
+local App = {}
+App.__index = App
+
+local function describe(instances: { Instance }, locale): string
+	if #instances == 1 then
+		return instances[1].Name
+	end
+	return locale:t("toastSelectionItems", #instances)
+end
+
+function App.new(plugin: Plugin)
+	local self = setmetatable({}, App)
+	self._plugin = plugin
+	self._maid = Maid.new()
+	self._open = false
+	self._active = false
+	self._touchDetected = UserInputService.TouchEnabled
+	self._beforeTap = nil -- { selection, time } saved by the last tap
+	self._statsScheduled = false
+	self._mouseOnlyHintShown = false
+
+	self.OpenChanged = Signal.new()
+
+	self.settings = Settings.new(plugin)
+	self.locale = Locale.new(self.settings:Get("language"))
+	self.recognizer = GestureRecognizer.new()
+	self.recognizer:SetCombine(self.settings:Get("combineGestures"))
+	self.camera = CameraController.new(self.settings)
+	self.selection = SelectionController.new(self.settings)
+
+	self.input = TouchInput.new(self.recognizer, {
+		isBlocked = function(position)
+			return (self.panel ~= nil and self.panel:ContainsPoint(position))
+				or (self.zoomStrip ~= nil and self.zoomStrip:ContainsPoint(position))
+		end,
+		mouseEnabled = function()
+			return self.settings:Get("mouseInput")
+		end,
+	})
+
+	self:_bindGestures()
+	self:_bindSettings()
+
+	return self
+end
+
+-- Lifecycle --------------------------------------------------------------------------
+
+function App:IsOpen(): boolean
+	return self._open
+end
+
+function App:Toggle()
+	if self._open then
+		self:Close()
+	else
+		self:Open()
+	end
+end
+
+function App:Open()
+	if self._open then
+		return
+	end
+	self._open = true
+	self:_ensureGui()
+	-- Opening always shows the full window; it can be collapsed from there.
+	self.panel:SetCollapsed(false, true)
+	self.panel:SetVisible(true)
+	self:SetActive(true)
+	self.OpenChanged:Fire(true)
+end
+
+function App:Close()
+	if not self._open then
+		return
+	end
+	self._open = false
+	self:SetActive(false)
+	if self.panel then
+		self.panel:SetVisible(false)
+	end
+	self.OpenChanged:Fire(false)
+end
+
+function App:SetActive(active: boolean)
+	if active == self._active then
+		if self.panel then
+			self.panel:SetActive(active)
+		end
+		return
+	end
+	self._active = active
+
+	if active then
+		-- Take over the mouse so Studio's select/drag tools do not react to the same touches.
+		self._plugin:Activate(true)
+		self.input:Start()
+		self._heartbeat = RunService.Heartbeat:Connect(function(dt)
+			self:_step(dt)
+		end)
+	else
+		self.input:Stop()
+		self.camera:Stop()
+		if self._heartbeat then
+			self._heartbeat:Disconnect()
+			self._heartbeat = nil
+		end
+		if self.overlay then
+			self.overlay:ClearTouches()
+			self.overlay:ShowGesture(nil, nil)
+		end
+		pcall(function()
+			if self._plugin:IsActivated() then
+				self._plugin:Deactivate()
+			end
+		end)
+	end
+
+	if self.panel then
+		self.panel:SetActive(active)
+		self.panel:SetTouchCount(0)
+		self.panel:SetGesture(nil)
+	end
+	self:_refreshZoomStrip()
+end
+
+-- Runs every frame while touch controls are active.
+function App:_step(dt: number)
+	-- Both fingers have reported by now: apply this frame's two-finger movement.
+	self.recognizer:Flush()
+	self.camera:Step(dt)
+end
+
+-- The zoom strip is only useful while touch controls are running.
+function App:_refreshZoomStrip()
+	local strip = self.zoomStrip
+	if strip then
+		strip:SetSide(self.settings:Get("zoomSide"))
+		strip:SetVisible(self._open and self._active and self.settings:Get("showZoomStrip"))
+	end
+end
+
+-- Shows a camera move in the window and on the viewport.
+function App:_showGesture(gesture: string?)
+	if self.panel then
+		self.panel:SetGesture(gesture)
+	end
+	if self.overlay then
+		local text = if gesture then self.locale:gesture(gesture) else nil
+		self.overlay:ShowGesture(text, if gesture then Theme.GestureColor[gesture] else nil)
+	end
+end
+
+-- Studio deactivates the plugin when the user picks another tool (Select, Move, ...).
+function App:OnPluginDeactivated()
+	if self._active and not self._plugin:IsActivated() then
+		self:SetActive(false)
+		if self.overlay then
+			self.overlay:Toast(self.locale:t("toastPausedByTool"), Theme.Color.Amber)
+		end
+	end
+end
+
+function App:Destroy()
+	self:SetActive(false)
+	self:_destroyGui()
+	self._maid:Clean()
+	self.OpenChanged:DisconnectAll()
+end
+
+-- GUI ----------------------------------------------------------------------------------
+
+function App:_ensureGui()
+	if self.gui then
+		return
+	end
+
+	-- A previous copy of the plugin (e.g. before a reload) may have left its UI behind.
+	local leftover = CoreGui:FindFirstChild("TouchPeak")
+	if leftover then
+		leftover:Destroy()
+	end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "TouchPeak"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.DisplayOrder = 50
+	gui.Archivable = false
+	gui.Parent = CoreGui
+	self.gui = gui
+
+	self.overlay = Overlay.new(gui, self.settings)
+	self:_createPanel()
+	self:_createZoomStrip()
+end
+
+function App:_createZoomStrip()
+	local strip = ZoomStrip.new({
+		parent = self.gui,
+		side = self.settings:Get("zoomSide"),
+	})
+	local function center(): Vector2
+		local camera = Workspace.CurrentCamera
+		return if camera then camera.ViewportSize / 2 else Vector2.zero
+	end
+	strip.Began:Connect(function()
+		-- Zoom toward whatever is in the middle of the screen.
+		self.camera:BeginInteraction()
+		self.camera:AnchorAt(center())
+		self:_showGesture("zoom")
+	end)
+	strip.Moved:Connect(function(dy)
+		-- Finger up (negative dy) moves closer.
+		self.camera:Zoom(math.exp(dy / STRIP_PIXELS_PER_E), center())
+	end)
+	strip.Ended:Connect(function()
+		self:_showGesture(nil)
+	end)
+	self.zoomStrip = strip
+	self:_refreshZoomStrip()
+end
+
+function App:_createPanel()
+	self.panel = Panel.new({
+		parent = self.gui,
+		settings = self.settings,
+		locale = self.locale,
+		active = self._active,
+		touchDetected = self._touchDetected,
+		onActiveChanged = function(active)
+			self:SetActive(active)
+			if active and self.overlay then
+				self.overlay:Toast(self.locale:t("toastResumed"), Theme.Color.Green)
+			end
+		end,
+		onClose = function()
+			self:Close()
+		end,
+	})
+	self.panel:SetInputStats(self.input.Stats)
+end
+
+-- Rebuilds the window in place (used when the language changes).
+function App:_rebuildPanel()
+	if not self.panel then
+		return
+	end
+	local wasVisible = self.panel:IsVisible()
+	local wasCollapsed = self.panel:IsCollapsed()
+	self.panel:Destroy()
+	self:_createPanel()
+	self.panel:SetCollapsed(wasCollapsed, true)
+	self.panel:SetVisible(wasVisible, true)
+	if self.zoomStrip then
+		self.zoomStrip:Destroy()
+		self:_createZoomStrip()
+	end
+end
+
+function App:_destroyGui()
+	if self.zoomStrip then
+		self.zoomStrip:Destroy()
+		self.zoomStrip = nil
+	end
+	if self.panel then
+		self.panel:Destroy()
+		self.panel = nil
+	end
+	if self.overlay then
+		self.overlay:Destroy()
+		self.overlay = nil
+	end
+	if self.gui then
+		self.gui:Destroy()
+		self.gui = nil
+	end
+end
+
+-- Wiring -------------------------------------------------------------------------------
+
+function App:_bindGestures()
+	local recognizer = self.recognizer
+	local camera = self.camera
+	local maid = self._maid
+
+	-- Visual feedback for real fingers.
+	maid:Give(self.input.TouchBegan:Connect(function(id, position)
+		if not self._touchDetected then
+			self._touchDetected = true
+			if self.panel then
+				self.panel:SetTouchDetected(true)
+			end
+		end
+		if self.overlay then
+			self.overlay:TouchBegan(id, position)
+		end
+	end))
+	maid:Give(self.input.TouchMoved:Connect(function(id, position)
+		if self.overlay then
+			self.overlay:TouchMoved(id, position)
+		end
+	end))
+	maid:Give(self.input.TouchEnded:Connect(function(id)
+		if self.overlay then
+			self.overlay:TouchEnded(id)
+		end
+	end))
+
+	-- Camera.
+	maid:Give(recognizer.InteractionBegan:Connect(function()
+		camera:BeginInteraction()
+	end))
+	maid:Give(recognizer.Rotate:Connect(function(delta)
+		camera:Rotate(delta)
+	end))
+	maid:Give(recognizer.RotateEnded:Connect(function(velocity)
+		camera:StartInertia("rotate", velocity)
+	end))
+	maid:Give(recognizer.AnchorBegan:Connect(function(centroid)
+		camera:AnchorAt(centroid)
+	end))
+	maid:Give(recognizer.Pan:Connect(function(delta)
+		camera:Pan(delta)
+	end))
+	maid:Give(recognizer.PanEnded:Connect(function(velocity)
+		camera:StartInertia("pan", velocity)
+	end))
+	maid:Give(recognizer.Zoom:Connect(function(scale, centroid)
+		camera:Zoom(scale, centroid)
+	end))
+
+	-- Roblox's own pinch event, used only when Studio does not report both fingers.
+	maid:Give(self.input.PinchBegan:Connect(function(centroid)
+		local viewport = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.zero
+		camera:AnchorAt(centroid or viewport / 2)
+	end))
+	maid:Give(self.input.Pinch:Connect(function(scale, centroid)
+		camera:Zoom(scale, centroid)
+	end))
+
+	-- Selection.
+	maid:Give(recognizer.Tap:Connect(function(position)
+		self:_onTap(position)
+	end))
+	maid:Give(recognizer.DoubleTap:Connect(function(position)
+		self:_onDoubleTap(position)
+	end))
+	maid:Give(recognizer.LongPress:Connect(function(position)
+		self:_onLongPress(position)
+	end))
+	maid:Give(recognizer.TapDragBegan:Connect(function()
+		self:_undoTapSelection()
+	end))
+
+	-- Status readouts.
+	maid:Give(recognizer.GestureChanged:Connect(function(gesture)
+		self:_showGesture(gesture)
+		if gesture then
+			self:_maybeExplainMouseOnly()
+		end
+	end))
+	maid:Give(recognizer.TouchCountChanged:Connect(function(count)
+		if self.panel then
+			self.panel:SetTouchCount(count, self.input:IsMouseActive())
+		end
+	end))
+
+	-- Diagnostics: refresh the counters a few times per second at most.
+	maid:Give(self.input.StatsChanged:Connect(function()
+		if self._statsScheduled then
+			return
+		end
+		self._statsScheduled = true
+		task.delay(STATS_REFRESH, function()
+			self._statsScheduled = false
+			if self.panel then
+				self.panel:SetInputStats(self.input.Stats)
+			end
+		end)
+	end))
+end
+
+-- On a touch screen where Studio only ever sends mouse events, point the user
+-- at the mode bar once: pinch and two-finger pan cannot work there.
+function App:_maybeExplainMouseOnly()
+	if self._mouseOnlyHintShown or not self.input:IsMouseActive() then
+		return
+	end
+	if not UserInputService.TouchEnabled or self.input.Stats.touchBegan > 0 then
+		return
+	end
+	self._mouseOnlyHintShown = true
+	if self.overlay then
+		self.overlay:Toast(self.locale:t("toastMouseOnly"), Theme.Color.Amber)
+	end
+end
+
+function App:_bindSettings()
+	self._maid:Give(self.settings.Changed:Connect(function(key, value)
+		if key == "combineGestures" then
+			self.recognizer:SetCombine(value)
+		elseif key == "language" then
+			self.locale:SetLanguage(value)
+			-- Defer so the language button finishes handling its click first.
+			task.defer(function()
+				self:_rebuildPanel()
+			end)
+		elseif key == "showTouches" and not value and self.overlay then
+			self.overlay:ClearTouches()
+		elseif key == "showZoomStrip" or key == "zoomSide" then
+			self:_refreshZoomStrip()
+		end
+	end))
+end
+
+function App:_onTap(position: Vector2)
+	self._beforeTap = { selection = self.selection:Get(), time = os.clock() }
+	local target = self.selection:SelectAt(position)
+	local overlay = self.overlay
+	if not overlay then
+		return
+	end
+	overlay:Ripple(position)
+	if target then
+		overlay:Toast(self.locale:t("toastSelected", target.Name))
+	else
+		overlay:Toast(self.locale:t("toastCleared"), Theme.Color.Ash)
+	end
+end
+
+-- The tap that started a tap-and-drag zoom should not have changed the selection.
+function App:_undoTapSelection()
+	local saved = self._beforeTap
+	self._beforeTap = nil
+	if saved and os.clock() - saved.time <= TAP_UNDO_WINDOW then
+		self.selection:Set(saved.selection)
+		if self.overlay then
+			self.overlay:HideToast()
+		end
+	end
+end
+
+function App:_onDoubleTap(position: Vector2)
+	local target = self.selection:SelectAt(position)
+	local focusOn = if target then { target } else self.selection:Get()
+	local focused = #focusOn > 0 and self.camera:FocusOn(focusOn)
+
+	local overlay = self.overlay
+	if not overlay then
+		return
+	end
+	overlay:Ripple(position)
+	if focused then
+		overlay:Toast(self.locale:t("toastFocused", describe(focusOn, self.locale)))
+	else
+		overlay:Toast(self.locale:t("toastNothingToFocus"), Theme.Color.Ash)
+	end
+end
+
+function App:_onLongPress(position: Vector2)
+	local target, added = self.selection:ToggleAt(position)
+	local overlay = self.overlay
+	if not overlay or not target then
+		return
+	end
+	overlay:Ripple(position)
+	local key = if added then "toastAdded" else "toastRemoved"
+	overlay:Toast(self.locale:t(key, target.Name), if added then Theme.Color.Bone else Theme.Color.Ash)
+end
+
+return App
+]]></ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="Folder" referent="RBX3">
+				<Properties>
+					<string name="Name">Camera</string>
+				</Properties>
+				<Item class="ModuleScript" referent="RBX4">
+					<Properties>
+						<string name="Name">CameraController</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Moves the Studio edit camera in response to gestures.
+
+	The camera orbits around a pivot point: whatever is in the middle of the
+	screen when a gesture starts (or the object you focused on last). Panning
+	keeps the point under your fingers glued to them, and pinching zooms
+	toward the point between your fingers. When the camera gets very close to
+	that point it switches to flying forward, so you can pinch your way
+	through walls and into buildings.
+]]
+
+local Workspace = game:GetService("Workspace")
+
+local Raycast = require(script.Parent.Raycast)
+
+local MAX_PITCH = math.rad(88)
+local DEFAULT_PIVOT_DISTANCE = 40
+local MIN_ORBIT_DISTANCE = 0.5
+local MIN_ZOOM_DISTANCE = 2
+local MAX_ZOOM_DISTANCE = 15000
+local MIN_PAN_DEPTH = 1
+local FOCUS_AXIS_COS = math.cos(math.rad(3))
+local FOCUS_DURATION = 0.45
+local FOCUS_MARGIN = 1.15
+local MAX_FOCUS_PARTS = 5000
+
+local INERTIA_FRICTION = 7 -- 1/s; a flick at v px/s coasts another v / 7 px
+local INERTIA_START_SPEED = 80 -- px/s
+local INERTIA_STOP_SPEED = 10 -- px/s
+
+local function sameCFrame(a: CFrame, b: CFrame): boolean
+	return (a.Position - b.Position).Magnitude < 1e-3
+		and a.LookVector:Dot(b.LookVector) > 1 - 1e-6
+		and a.UpVector:Dot(b.UpVector) > 1 - 1e-6
+end
+
+-- Camera right vector flattened onto the ground plane, so pitching never rolls the view.
+local function horizontalRight(cframe: CFrame): Vector3
+	local right = cframe.RightVector
+	local flat = Vector3.new(right.X, 0, right.Z)
+	if flat.Magnitude < 1e-4 then
+		local look = cframe.LookVector
+		flat = Vector3.new(-look.Z, 0, look.X)
+	end
+	if flat.Magnitude < 1e-4 then
+		return Vector3.xAxis
+	end
+	return flat.Unit
+end
+
+local function expandBounds(bounds, cframe: CFrame, size: Vector3)
+	local half = size / 2
+	for _, x in { -1, 1 } do
+		for _, y in { -1, 1 } do
+			for _, z in { -1, 1 } do
+				local corner = cframe:PointToWorldSpace(Vector3.new(half.X * x, half.Y * y, half.Z * z))
+				local min, max = bounds.min, bounds.max
+				if min then
+					bounds.min =
+						Vector3.new(math.min(min.X, corner.X), math.min(min.Y, corner.Y), math.min(min.Z, corner.Z))
+					bounds.max =
+						Vector3.new(math.max(max.X, corner.X), math.max(max.Y, corner.Y), math.max(max.Z, corner.Z))
+				else
+					bounds.min, bounds.max = corner, corner
+				end
+			end
+		end
+	end
+end
+
+local function addToBounds(instance: Instance, bounds)
+	if instance:IsA("Terrain") then
+		return
+	elseif instance:IsA("BasePart") then
+		expandBounds(bounds, instance.CFrame, instance.Size)
+	elseif instance:IsA("Model") then
+		local ok, cframe, size = pcall(instance.GetBoundingBox, instance)
+		if ok then
+			expandBounds(bounds, cframe, size)
+		end
+	elseif instance:IsA("Attachment") then
+		expandBounds(bounds, instance.WorldCFrame, Vector3.zero)
+	else
+		-- Folders and other containers: use the parts inside them.
+		local counted = 0
+		for _, descendant in instance:GetDescendants() do
+			if descendant:IsA("BasePart") and not descendant:IsA("Terrain") then
+				expandBounds(bounds, descendant.CFrame, descendant.Size)
+				counted += 1
+				if counted >= MAX_FOCUS_PARTS then
+					break
+				end
+			end
+		end
+	end
+end
+
+local CameraController = {}
+CameraController.__index = CameraController
+
+function CameraController.new(settings)
+	local self = setmetatable({}, CameraController)
+	self._settings = settings
+	self._pivot = nil :: Vector3?
+	self._focusDepth = nil :: number? -- "look" mode: how far ahead Studio's focus sits
+	self._lastCFrame = nil :: CFrame?
+	self._anchor = nil :: Vector3?
+	self._inertia = nil
+	self._focus = nil
+	return self
+end
+
+function CameraController:_camera(): Camera?
+	return Workspace.CurrentCamera
+end
+
+-- True while the camera is still where we last put it.
+function CameraController:_isOurs(camera: Camera): boolean
+	return self._lastCFrame ~= nil and sameCFrame(camera.CFrame, self._lastCFrame)
+end
+
+-- Studio's edit camera keeps aiming at Camera.Focus: a focus point that is not
+-- straight ahead makes Studio turn the camera back toward it. So Focus always
+-- moves along with the camera, on its line of sight.
+function CameraController:_apply(camera: Camera, cframe: CFrame, pivot: Vector3)
+	local depth
+	if self._settings:Get("rotateMode") == "look" then
+		depth = self._focusDepth or DEFAULT_PIVOT_DISTANCE
+	else
+		depth = (pivot - cframe.Position):Dot(cframe.LookVector)
+	end
+	depth = math.clamp(depth, MIN_ORBIT_DISTANCE, MAX_ZOOM_DISTANCE)
+
+	camera.Focus = CFrame.new(cframe.Position + cframe.LookVector * depth)
+	camera.CFrame = cframe
+	self._pivot = pivot
+	self._lastCFrame = camera.CFrame
+end
+
+function CameraController:_resolvePivot(camera: Camera): Vector3
+	local cframe = camera.CFrame
+	local look = cframe.LookVector
+
+	-- 1. Whatever sits in the middle of the screen.
+	local viewport = camera.ViewportSize
+	local ray = camera:ViewportPointToRay(viewport.X / 2, viewport.Y / 2)
+	local hit = Raycast.cast(ray.Origin, ray.Direction * Raycast.MaxDistance, Raycast.isVisible)
+	if hit then
+		local depth = math.max((hit.Position - cframe.Position):Dot(look), MIN_ORBIT_DISTANCE)
+		return cframe.Position + look * depth
+	end
+
+	-- 2. Studio's own focus point, if it is still in front of the camera.
+	local toFocus = camera.Focus.Position - cframe.Position
+	local depth = toFocus:Dot(look)
+	if depth > MIN_ORBIT_DISTANCE and depth < MAX_ZOOM_DISTANCE and toFocus.Unit:Dot(look) > FOCUS_AXIS_COS then
+		return cframe.Position + look * depth
+	end
+
+	-- 3. Empty sky: a point a little in front of the camera.
+	return cframe.Position + look * DEFAULT_PIVOT_DISTANCE
+end
+
+function CameraController:_getPivot(camera: Camera): Vector3
+	if self._settings:Get("rotateMode") == "look" then
+		-- Turning in place: remember how far ahead Studio's focus was, to keep it there.
+		if self._focusDepth == nil or not self:_isOurs(camera) then
+			local cframe = camera.CFrame
+			local depth = (camera.Focus.Position - cframe.Position):Dot(cframe.LookVector)
+			self._focusDepth = if depth > MIN_ORBIT_DISTANCE and depth < MAX_ZOOM_DISTANCE
+				then depth
+				else DEFAULT_PIVOT_DISTANCE
+		end
+		return camera.CFrame.Position
+	end
+	if self._pivot and self:_isOurs(camera) then
+		return self._pivot
+	end
+	local pivot = self:_resolvePivot(camera)
+	self._pivot = pivot
+	return pivot
+end
+
+-- World point under a screen position, used as the zoom target and pan depth.
+function CameraController:_findAnchor(camera: Camera, screenPosition: Vector2, pivot: Vector3): Vector3
+	local hit, ray = Raycast.fromScreen(camera, screenPosition, Raycast.isVisible)
+	if hit then
+		return hit.Position
+	end
+
+	local cframe = camera.CFrame
+	local depth = (pivot - cframe.Position):Dot(cframe.LookVector)
+	if depth < MIN_PAN_DEPTH then
+		depth = DEFAULT_PIVOT_DISTANCE
+	end
+	local along = depth / math.max(ray.Direction:Dot(cframe.LookVector), 0.05)
+	return ray.Origin + ray.Direction * along
+end
+
+-- Gesture entry points ------------------------------------------------------------
+
+function CameraController:BeginInteraction()
+	self._inertia = nil
+	self._focus = nil
+	self._anchor = nil
+end
+
+-- Starts a pan or zoom: the world point under `screenPosition` becomes the
+-- zoom target and the depth at which panning follows the finger(s).
+function CameraController:AnchorAt(screenPosition: Vector2)
+	self._inertia = nil
+	self._focus = nil
+	local camera = self:_camera()
+	if not camera then
+		return
+	end
+	self._anchor = self:_findAnchor(camera, screenPosition, self:_getPivot(camera))
+end
+
+function CameraController:Rotate(delta: Vector2)
+	local camera = self:_camera()
+	if not camera then
+		return
+	end
+
+	local settings = self._settings
+	local viewport = camera.ViewportSize
+	-- Dragging across the short side of the viewport turns the camera 180 degrees.
+	local radiansPerPixel = math.pi / math.max(math.min(viewport.X, viewport.Y), 100)
+	radiansPerPixel *= settings:Get("rotateSensitivity")
+	if settings:Get("invertRotate") then
+		radiansPerPixel = -radiansPerPixel
+	end
+
+	local cframe = camera.CFrame
+	local pivot = self:_getPivot(camera)
+	local look = cframe.LookVector
+
+	local yaw = -delta.X * radiansPerPixel
+	local currentPitch = math.asin(math.clamp(look.Y, -1, 1))
+	local targetPitch = math.clamp(currentPitch - delta.Y * radiansPerPixel, -MAX_PITCH, MAX_PITCH)
+	local pitch = targetPitch - currentPitch
+
+	local rotation = CFrame.fromAxisAngle(Vector3.yAxis, yaw) * CFrame.fromAxisAngle(horizontalRight(cframe), pitch)
+	local position = pivot + rotation:VectorToWorldSpace(cframe.Position - pivot)
+	local newLook = rotation:VectorToWorldSpace(look)
+
+	self:_apply(camera, CFrame.lookAt(position, position + newLook), pivot)
+end
+
+function CameraController:Pan(delta: Vector2)
+	local camera = self:_camera()
+	if not camera then
+		return
+	end
+
+	local settings = self._settings
+	local cframe = camera.CFrame
+	local pivot = self:_getPivot(camera)
+	local anchor = self._anchor or pivot
+
+	-- Size of one pixel at the depth of the point under the fingers.
+	local depth = math.max((anchor - cframe.Position):Dot(cframe.LookVector), MIN_PAN_DEPTH)
+	local viewport = camera.ViewportSize
+	local studsPerPixel = 2 * depth * math.tan(math.rad(camera.FieldOfView) / 2) / math.max(viewport.Y, 1)
+	studsPerPixel *= settings:Get("panSensitivity")
+	if settings:Get("invertPan") then
+		studsPerPixel = -studsPerPixel
+	end
+
+	local offset = (cframe.UpVector * delta.Y - cframe.RightVector * delta.X) * studsPerPixel
+	self:_apply(camera, cframe + offset, pivot + offset)
+end
+
+-- scale < 1 moves closer (fingers spread apart), scale > 1 moves away.
+function CameraController:Zoom(scale: number, centroid: Vector2)
+	local camera = self:_camera()
+	if not camera then
+		return
+	end
+
+	local factor = scale ^ self._settings:Get("zoomSensitivity")
+	if factor ~= factor or factor <= 0 then
+		return
+	end
+
+	local cframe = camera.CFrame
+	local position = cframe.Position
+	local pivot = self:_getPivot(camera)
+	local anchor = self._anchor
+	if not anchor then
+		anchor = self:_findAnchor(camera, centroid, pivot)
+		self._anchor = anchor
+	end
+
+	local toAnchor = anchor - position
+	local distance = toAnchor.Magnitude
+	if distance < 1e-4 then
+		return
+	end
+	local direction = toAnchor / distance
+
+	local move = (1 - factor) * math.max(distance, MIN_ZOOM_DISTANCE)
+	local newDistance = distance - move
+	if newDistance > MAX_ZOOM_DISTANCE then
+		newDistance = math.max(MAX_ZOOM_DISTANCE, distance)
+		move = distance - newDistance
+	end
+	local offset = direction * move
+
+	local newPivot
+	if distance >= MIN_ZOOM_DISTANCE and newDistance >= MIN_ZOOM_DISTANCE then
+		-- Scale everything around the anchor; the pivot stays on the view axis.
+		newPivot = anchor + (pivot - anchor) * (newDistance / distance)
+	else
+		-- Too close to scale any further: fly forward and push the anchor ahead.
+		newPivot = pivot + offset
+		self._anchor = anchor + offset
+	end
+
+	self:_apply(camera, cframe + offset, newPivot)
+end
+
+function CameraController:StartInertia(kind: "rotate" | "pan", velocity: Vector2)
+	if not self._settings:Get("inertia") or velocity.Magnitude < INERTIA_START_SPEED then
+		return
+	end
+	self._inertia = { kind = kind, velocity = velocity }
+end
+
+-- Smoothly moves the camera so the given instances fill the view.
+function CameraController:FocusOn(instances: { Instance }): boolean
+	local camera = self:_camera()
+	if not camera then
+		return false
+	end
+
+	local bounds = {}
+	for _, instance in instances do
+		addToBounds(instance, bounds)
+	end
+	if not bounds.min then
+		return false
+	end
+
+	local center = (bounds.min + bounds.max) / 2
+	local radius = math.max((bounds.max - bounds.min).Magnitude / 2, 1)
+
+	local viewport = camera.ViewportSize
+	local verticalFov = math.rad(camera.FieldOfView)
+	local horizontalFov = 2 * math.atan(math.tan(verticalFov / 2) * viewport.X / math.max(viewport.Y, 1))
+	local halfAngle = math.min(verticalFov, horizontalFov) / 2
+	local distance = math.clamp(radius / math.sin(halfAngle) * FOCUS_MARGIN, MIN_ZOOM_DISTANCE, MAX_ZOOM_DISTANCE)
+
+	local from = camera.CFrame
+	local to = CFrame.new(center - from.LookVector * distance) * from.Rotation
+
+	self._inertia = nil
+	self._anchor = nil
+	self._lastCFrame = from
+	self._focus = { from = from, to = to, pivot = center, elapsed = 0 }
+	return true
+end
+
+function CameraController:IsAnimating(): boolean
+	return self._focus ~= nil or self._inertia ~= nil
+end
+
+function CameraController:Stop()
+	self._inertia = nil
+	self._focus = nil
+	self._anchor = nil
+end
+
+-- Advances inertia and focus animations; call every frame.
+function CameraController:Step(dt: number)
+	if not (self._focus or self._inertia) then
+		return
+	end
+	local camera = self:_camera()
+	if not camera then
+		return
+	end
+	if not self:_isOurs(camera) then
+		-- Something else (Studio's own controls) moved the camera: give way.
+		self:Stop()
+		return
+	end
+
+	local focus = self._focus
+	if focus then
+		focus.elapsed += dt
+		local alpha = math.clamp(focus.elapsed / FOCUS_DURATION, 0, 1)
+		local eased = 1 - (1 - alpha) ^ 3
+		self:_apply(camera, focus.from:Lerp(focus.to, eased), focus.pivot)
+		if alpha >= 1 then
+			self._focus = nil
+		end
+		return
+	end
+
+	local inertia = self._inertia
+	local decay = math.exp(-INERTIA_FRICTION * dt)
+	-- Exact distance travelled by an exponentially decaying velocity over dt.
+	local delta = inertia.velocity * ((1 - decay) / INERTIA_FRICTION)
+	inertia.velocity *= decay
+	if inertia.velocity.Magnitude < INERTIA_STOP_SPEED then
+		self._inertia = nil
+	end
+
+	if inertia.kind == "rotate" then
+		self:Rotate(delta)
+	else
+		self:Pan(delta)
+	end
+end
+
+return CameraController
+]]></ProtectedString>
+					</Properties>
+				</Item>
+				<Item class="ModuleScript" referent="RBX5">
+					<Properties>
+						<string name="Name">Raycast</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Raycasting helpers that can skip over unwanted hits (locked or invisible
+	parts) instead of stopping at them.
+]]
+
+local Workspace = game:GetService("Workspace")
+
+local Raycast = {}
+
+Raycast.MaxDistance = 15000 -- longest ray workspace:Raycast supports
+local MAX_SKIPS = 32
+
+-- Casts a ray and returns the first hit accepted by `accept` (or nil).
+function Raycast.cast(origin: Vector3, direction: Vector3, accept: (Instance) -> boolean): RaycastResult?
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local excluded = {}
+
+	for _ = 1, MAX_SKIPS do
+		params.FilterDescendantsInstances = excluded
+		local result = Workspace:Raycast(origin, direction, params)
+		if not result then
+			return nil
+		end
+		if accept(result.Instance) then
+			return result
+		end
+		table.insert(excluded, result.Instance)
+	end
+	return nil
+end
+
+-- Casts from a GUI-space screen position (as reported by InputObject.Position).
+function Raycast.fromScreen(camera: Camera, position: Vector2, accept: (Instance) -> boolean): (RaycastResult?, Ray)
+	local ray = camera:ScreenPointToRay(position.X, position.Y)
+	return Raycast.cast(ray.Origin, ray.Direction * Raycast.MaxDistance, accept), ray
+end
+
+-- Anything the eye can see stops the ray (used for camera pivots).
+function Raycast.isVisible(instance: Instance): boolean
+	if instance:IsA("BasePart") then
+		return instance.Transparency < 0.98
+	end
+	return true
+end
+
+return Raycast
+]]></ProtectedString>
+					</Properties>
+				</Item>
+			</Item>
+			<Item class="ModuleScript" referent="RBX6">
+				<Properties>
+					<string name="Name">Config</string>
+					<ProtectedString name="Source"><![CDATA[return {
+	Version = "1.3.0",
+	ToolbarName = "Touch Peak",
+	ButtonId = "TouchPeakToggle",
+	ButtonText = "Touch Peak",
+	-- Upload assets/icon.png to Roblox (Create > Decals) and paste "rbxassetid://<id>" here
+	-- to give the toolbar button an icon. Left empty, Studio shows the text only.
+	ToolbarIcon = "",
+}
+]]></ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="Folder" referent="RBX7">
+				<Properties>
+					<string name="Name">Input</string>
+				</Properties>
+				<Item class="ModuleScript" referent="RBX8">
+					<Properties>
+						<string name="Name">GestureRecognizer</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Turns raw touch points into high level gestures.
+
+	  1 finger drag ............ Rotate(delta)         -> RotateEnded(velocity)
+	  tap, then drag ........... TapDragBegan(position), Pan(delta) -> PanEnded(velocity)
+	  2 fingers, apart/together  Zoom(scale, centroid)
+	  2 fingers, same direction  Pan(delta, centroid)  -> PanEnded(velocity)
+	  quick tap ................ Tap(position)
+	  second quick tap ......... DoubleTap(position)
+	  press and hold ........... LongPress(position)
+
+	AnchorBegan(position) fires when a pan or zoom starts, with the screen
+	point the camera should zoom toward / keep under the fingers.
+
+	Roblox Studio on Windows usually reports a touch screen as a single mouse
+	pointer, which is why panning also works with one finger ("tap, then
+	drag"). Zoom has its own on-screen strip.
+
+	Touches are identified by any key (Roblox reuses the same InputObject for
+	the whole life of a finger), so the recognizer does not depend on Studio
+	and can be driven from tests with a fake clock.
+
+	A two-finger gesture is locked to either zoom or pan once the fingers have
+	moved far enough to tell the two apart, unless `combine` is enabled.
+	After a two-finger gesture the remaining finger is ignored until every
+	finger is lifted, so lifting one finger never makes the camera jump.
+
+	Roblox reports each finger in its own input event. Two-finger movement is
+	therefore collected and evaluated once per frame by `Flush()` (call it from
+	Heartbeat); otherwise the first finger of a pan would look like a pinch.
+	If nobody flushes, pending movement is evaluated after `maxBatchDelay`.
+]]
+
+local Signal = require(script.Parent.Parent.Util.Signal)
+
+local DEFAULT_CONFIG = {
+	tapSlop = 10, -- px a finger may drift and still count as a tap
+	doubleTapTime = 0.32, -- s from lifting the finger to touching again
+	doubleTapSlop = 40, -- px between two taps
+	longPressTime = 0.6, -- s
+	twoFingerLockDistance = 10, -- px before deciding between zoom and pan
+	velocityWindow = 0.1, -- s of movement used for the release velocity
+	releaseStaleTime = 0.08, -- s without movement before release cancels inertia
+	maxReleaseSpeed = 2500, -- px/s
+	maxBatchDelay = 0.05, -- s two-finger movement may wait for Flush()
+}
+
+-- idle        nothing touching
+-- pending     one finger down, could still become a tap, a drag or a long press
+-- held        long press fired; moving now still starts a drag
+-- drag        one finger dragging: rotating, or panning after a tap (see _dragKind)
+-- twoPending  two fingers down, not yet clear whether zoom or pan
+-- twoZoom / twoPan / twoBoth
+-- blocked     a two-finger gesture ended but a finger is still down
+export type Mode = "idle" | "pending" | "held" | "drag" | "twoPending" | "twoZoom" | "twoPan" | "twoBoth" | "blocked"
+
+local TWO_FINGER_GESTURE = {
+	twoZoom = "zoom",
+	twoPan = "pan",
+	twoBoth = "both",
+}
+
+local GestureRecognizer = {}
+GestureRecognizer.__index = GestureRecognizer
+
+GestureRecognizer.DefaultConfig = DEFAULT_CONFIG
+
+export type Options = {
+	clock: (() -> number)?,
+	delay: ((number, () -> ()) -> any)?,
+	config: { [string]: number }?,
+}
+
+function GestureRecognizer.new(options: Options?)
+	local opts: Options = options or {}
+	local self = setmetatable({}, GestureRecognizer)
+
+	self._clock = opts.clock or os.clock
+	self._delay = opts.delay or task.delay
+	self._config = table.clone(DEFAULT_CONFIG)
+	for key, value in opts.config or {} do
+		self._config[key] = value
+	end
+
+	self._combine = false
+	self._dragKind = "rotate" :: "rotate" | "pan"
+	self._mode = "idle" :: Mode
+	self._gesture = nil :: string?
+	self._touches = {} -- id -> record
+	self._order = {} -- ids of the (at most two) tracked fingers
+	self._ignored = {} -- id -> true for extra fingers
+	self._count = 0
+	self._samples = {}
+	self._lastTap = nil
+	self._longPressToken = 0
+
+	self._startCentroid = nil
+	self._startDistance = nil
+	self._prevCentroid = nil
+	self._prevDistance = nil
+	self._pendingSince = nil -- time of the oldest unflushed two-finger movement
+
+	self.InteractionBegan = Signal.new()
+	self.TouchCountChanged = Signal.new()
+	self.GestureChanged = Signal.new()
+	self.AnchorBegan = Signal.new()
+	self.TapDragBegan = Signal.new()
+	self.Rotate = Signal.new()
+	self.RotateEnded = Signal.new()
+	self.Pan = Signal.new()
+	self.PanEnded = Signal.new()
+	self.Zoom = Signal.new()
+	self.Tap = Signal.new()
+	self.DoubleTap = Signal.new()
+	self.LongPress = Signal.new()
+
+	return self
+end
+
+function GestureRecognizer:SetCombine(combine: boolean)
+	self._combine = combine
+end
+
+function GestureRecognizer:GetMode(): Mode
+	return self._mode
+end
+
+function GestureRecognizer:GetGesture(): string?
+	return self._gesture
+end
+
+function GestureRecognizer:GetTouchCount(): number
+	return self._count
+end
+
+function GestureRecognizer:IsTracking(id: any): boolean
+	return self._touches[id] ~= nil or self._ignored[id] ~= nil
+end
+
+local function isTwoFinger(mode: Mode): boolean
+	return mode == "twoPending" or mode == "twoZoom" or mode == "twoPan" or mode == "twoBoth"
+end
+
+-- Touch events ----------------------------------------------------------------
+
+-- `slop` overrides how far this finger may move and still count as a tap.
+function GestureRecognizer:TouchBegan(id: any, position: Vector2, slop: number?)
+	if self:IsTracking(id) then
+		return
+	end
+	self:Flush()
+
+	if #self._order >= 2 or self._mode == "blocked" then
+		self._ignored[id] = true
+		self:_updateCount()
+		return
+	end
+
+	local now = self._clock()
+	local config = self._config
+	local last = self._lastTap
+	local record = {
+		id = id,
+		start = position,
+		position = position,
+		startTime = now,
+		slop = slop or config.tapSlop,
+		-- Touching again right where a tap just ended: a double tap, or a tap-and-drag pan.
+		afterTap = last ~= nil
+			and now - last.time <= config.doubleTapTime
+			and (position - last.position).Magnitude <= config.doubleTapSlop,
+	}
+	self._touches[id] = record
+	table.insert(self._order, id)
+
+	if #self._order == 1 then
+		self._mode = "pending"
+		self._samples = {}
+		self.InteractionBegan:Fire()
+		-- After a tap, a pause before dragging must not turn into a long press.
+		if not record.afterTap then
+			self:_scheduleLongPress(record)
+		end
+	else
+		-- A second finger turns whatever the first one was doing into a two-finger gesture.
+		self:_cancelLongPress()
+		self._lastTap = nil
+		self._samples = {}
+
+		local a, b = self:_pair()
+		local centroid = (a.position + b.position) / 2
+		local distance = math.max((a.position - b.position).Magnitude, 1)
+		self._startCentroid = centroid
+		self._startDistance = distance
+		self._prevCentroid = centroid
+		self._prevDistance = distance
+
+		self._mode = "twoPending"
+		self:_setGesture(nil)
+		self.AnchorBegan:Fire(centroid)
+	end
+
+	self:_updateCount()
+end
+
+function GestureRecognizer:TouchMoved(id: any, position: Vector2)
+	local record = self._touches[id]
+	if not record then
+		return
+	end
+
+	local previous = record.position
+	record.position = position
+	local mode = self._mode
+	local now = self._clock()
+
+	if mode == "pending" or mode == "held" then
+		local offset = position - record.start
+		if offset.Magnitude > record.slop then
+			self:_cancelLongPress()
+			self:_beginDrag(record)
+			-- Include the slop so the camera catches up with the finger.
+			self:_emitDrag(record, offset, now)
+		end
+	elseif mode == "drag" then
+		local delta = position - previous
+		if delta.Magnitude > 0 then
+			self:_emitDrag(record, delta, now)
+		end
+	elseif isTwoFinger(mode) then
+		self._pendingSince = self._pendingSince or now
+		if now - self._pendingSince >= self._config.maxBatchDelay then
+			self:Flush()
+		end
+	end
+end
+
+-- Applies two-finger movement collected since the last call. Call once per frame.
+function GestureRecognizer:Flush()
+	if self._pendingSince == nil then
+		return
+	end
+	self._pendingSince = nil
+	if isTwoFinger(self._mode) then
+		self:_updateTwoFinger(self._clock())
+	end
+end
+
+function GestureRecognizer:TouchEnded(id: any, position: Vector2?)
+	if self._ignored[id] then
+		self._ignored[id] = nil
+		self:_settle()
+		return
+	end
+
+	local record = self._touches[id]
+	if not record then
+		return
+	end
+	if position and position ~= record.position then
+		self:TouchMoved(id, position)
+	end
+	self:Flush()
+
+	local now = self._clock()
+	local mode = self._mode
+	self._touches[id] = nil
+	table.remove(self._order, table.find(self._order, id))
+
+	if mode == "pending" then
+		self:_cancelLongPress()
+		self._mode = "idle"
+		self:_handleTap(record, now)
+	elseif mode == "held" then
+		self._mode = "idle"
+	elseif mode == "drag" then
+		self._mode = "idle"
+		self:_setGesture(nil)
+		local velocity = self:_releaseVelocity(now)
+		if self._dragKind == "rotate" then
+			self.RotateEnded:Fire(velocity)
+		else
+			self.PanEnded:Fire(velocity)
+		end
+	elseif isTwoFinger(mode) then
+		self._mode = "blocked"
+		self:_setGesture(nil)
+		if mode == "twoPan" or mode == "twoBoth" then
+			self.PanEnded:Fire(self:_releaseVelocity(now))
+		end
+	end
+
+	self:_settle()
+end
+
+-- Forget every finger without firing taps or inertia (e.g. when the plugin gets paused).
+function GestureRecognizer:Cancel()
+	self:_cancelLongPress()
+	table.clear(self._touches)
+	table.clear(self._order)
+	table.clear(self._ignored)
+	self._samples = {}
+	self._lastTap = nil
+	self._pendingSince = nil
+	self._mode = "idle"
+	self:_setGesture(nil)
+	self:_updateCount()
+end
+
+-- Internals -------------------------------------------------------------------
+
+function GestureRecognizer:_pair()
+	return self._touches[self._order[1]], self._touches[self._order[2]]
+end
+
+function GestureRecognizer:_beginDrag(record)
+	local kind = if record.afterTap then "pan" else "rotate"
+	self._mode = "drag"
+	self._dragKind = kind
+	self._samples = {}
+	self._lastTap = nil
+	self:_setGesture(kind)
+	if kind == "pan" then
+		self.TapDragBegan:Fire(record.start)
+		self.AnchorBegan:Fire(record.start)
+	end
+end
+
+function GestureRecognizer:_emitDrag(record, delta: Vector2, now: number)
+	self:_addSample(now, delta)
+	if self._dragKind == "rotate" then
+		self.Rotate:Fire(delta)
+	else
+		self.Pan:Fire(delta, record.position)
+	end
+end
+
+function GestureRecognizer:_updateTwoFinger(now: number)
+	local a, b = self:_pair()
+	if not (a and b) then
+		return
+	end
+
+	local centroid = (a.position + b.position) / 2
+	local distance = math.max((a.position - b.position).Magnitude, 1)
+
+	if self._mode == "twoPending" then
+		local spread = math.abs(distance - self._startDistance)
+		local travel = (centroid - self._startCentroid).Magnitude
+		if math.max(spread, travel) < self._config.twoFingerLockDistance then
+			return
+		end
+
+		local mode
+		if self._combine then
+			mode = "twoBoth"
+		elseif spread > travel then
+			mode = "twoZoom"
+		else
+			mode = "twoPan"
+		end
+		self._mode = mode
+		self:_setGesture(TWO_FINGER_GESTURE[mode])
+		-- _prevCentroid/_prevDistance still hold the starting values, so the
+		-- movement made while deciding is applied below.
+	end
+
+	local mode = self._mode
+	local panDelta = centroid - self._prevCentroid
+	local scale = self._prevDistance / distance
+
+	if (mode == "twoPan" or mode == "twoBoth") and panDelta.Magnitude > 0 then
+		self:_addSample(now, panDelta)
+		self.Pan:Fire(panDelta, centroid)
+	end
+	if (mode == "twoZoom" or mode == "twoBoth") and scale ~= 1 then
+		self.Zoom:Fire(scale, centroid)
+	end
+
+	self._prevCentroid = centroid
+	self._prevDistance = distance
+end
+
+function GestureRecognizer:_handleTap(record, now: number)
+	if record.afterTap then
+		self._lastTap = nil
+		self.DoubleTap:Fire(record.position)
+	else
+		self._lastTap = { time = now, position = record.position }
+		self.Tap:Fire(record.position)
+	end
+end
+
+function GestureRecognizer:_scheduleLongPress(record)
+	self._longPressToken += 1
+	local token = self._longPressToken
+
+	self._delay(self._config.longPressTime, function()
+		if token ~= self._longPressToken then
+			return
+		end
+		if self._mode ~= "pending" or self._touches[record.id] ~= record then
+			return
+		end
+		self._mode = "held"
+		self._lastTap = nil
+		self.LongPress:Fire(record.position)
+	end)
+end
+
+function GestureRecognizer:_cancelLongPress()
+	self._longPressToken += 1
+end
+
+function GestureRecognizer:_addSample(now: number, delta: Vector2)
+	local samples = self._samples
+	table.insert(samples, { time = now, delta = delta })
+
+	local cutoff = now - self._config.velocityWindow
+	while samples[1] and samples[1].time < cutoff do
+		table.remove(samples, 1)
+	end
+end
+
+function GestureRecognizer:_releaseVelocity(now: number): Vector2
+	local samples = self._samples
+	self._samples = {}
+
+	local config = self._config
+	local newest = samples[#samples]
+	if not newest or now - newest.time > config.releaseStaleTime then
+		return Vector2.zero
+	end
+
+	local cutoff = now - config.velocityWindow
+	local total = Vector2.zero
+	local first, count = nil, 0
+	for _, sample in samples do
+		if sample.time >= cutoff then
+			total += sample.delta
+			first = first or sample.time
+			count += 1
+		end
+	end
+	if count == 0 then
+		return Vector2.zero
+	end
+
+	-- n samples spaced dt apart describe n intervals of movement.
+	local span = newest.time - first
+	span = if count > 1 then span + span / (count - 1) else 1 / 60
+	span = math.max(span, 1 / 240)
+
+	local velocity = total / span
+	if velocity.Magnitude > config.maxReleaseSpeed then
+		velocity = velocity.Unit * config.maxReleaseSpeed
+	end
+	return velocity
+end
+
+function GestureRecognizer:_settle()
+	if #self._order == 0 and next(self._ignored) == nil and self._mode == "blocked" then
+		self._mode = "idle"
+	end
+	self:_updateCount()
+end
+
+function GestureRecognizer:_setGesture(gesture: string?)
+	if self._gesture == gesture then
+		return
+	end
+	self._gesture = gesture
+	self.GestureChanged:Fire(gesture)
+end
+
+function GestureRecognizer:_updateCount()
+	local count = #self._order
+	for _ in self._ignored do
+		count += 1
+	end
+	if count ~= self._count then
+		self._count = count
+		self.TouchCountChanged:Fire(count)
+	end
+end
+
+return GestureRecognizer
+]]></ProtectedString>
+					</Properties>
+				</Item>
+				<Item class="ModuleScript" referent="RBX9">
+					<Properties>
+						<string name="Name">TouchInput</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Feeds UserInputService touches (and, optionally, the left mouse button as a
+	single "finger") into a GestureRecognizer.
+
+	Touches that start on top of the plugin's own UI are left alone for their
+	whole lifetime, so dragging the window never moves the camera.
+
+	Roblox Studio on Windows often hands a touch screen to plugins as a plain
+	mouse (one pointer, no second finger). Everything here is written so the
+	mouse path keeps working even when events get lost, and `Stats` records
+	what Studio actually delivers so the diagnostics panel can show it.
+]]
+
+local UserInputService = game:GetService("UserInputService")
+
+local Maid = require(script.Parent.Parent.Util.Maid)
+local Signal = require(script.Parent.Parent.Util.Signal)
+
+local MOUSE_ID = "Mouse"
+-- Windows turns touches into fake mouse clicks right after the real touch
+-- events; ignore the mouse for a moment after a touch to avoid doubling up.
+local MOUSE_AFTER_TOUCH_COOLDOWN = 0.35
+-- Windows already filters jitter out of the pointer, so the mouse may start a
+-- drag sooner than a raw finger.
+local MOUSE_TAP_SLOP = 5
+
+local TouchInput = {}
+TouchInput.__index = TouchInput
+
+export type Options = {
+	isBlocked: (position: Vector2) -> boolean,
+	mouseEnabled: () -> boolean,
+}
+
+local function toVector2(position: Vector3): Vector2
+	return Vector2.new(position.X, position.Y)
+end
+
+local function newStats()
+	return {
+		touchBegan = 0,
+		touchChanged = 0,
+		touchEnded = 0,
+		touchFingers = 0, -- most real fingers seen down at the same time
+		mouseDown = 0,
+		mouseMoves = 0,
+		wheel = 0,
+		pinch = 0,
+		pan = 0,
+	}
+end
+
+function TouchInput.new(recognizer, options: Options)
+	local self = setmetatable({}, TouchInput)
+	self._recognizer = recognizer
+	self._isBlocked = options.isBlocked
+	self._mouseEnabled = options.mouseEnabled
+	self._maid = Maid.new()
+	self._running = false
+	self._touches = {} -- InputObject -> true for touches we forward
+	self._down = {} -- InputObject -> true for every real finger on screen (stats)
+	self._mouseDown = false
+	self._lastTouchTime = -math.huge
+	self._pinchScale = nil
+
+	self.Stats = newStats()
+	self.StatsChanged = Signal.new()
+
+	-- Visual feedback hooks (only real fingers, the mouse has its own cursor).
+	self.TouchBegan = Signal.new()
+	self.TouchMoved = Signal.new()
+	self.TouchEnded = Signal.new()
+
+	-- Roblox's own pinch gesture, as a backup when raw fingers are not reported:
+	-- Pinch(scaleStep, centroid?) where scaleStep < 1 means the fingers spread apart.
+	self.PinchBegan = Signal.new()
+	self.Pinch = Signal.new()
+
+	return self
+end
+
+function TouchInput:IsRunning(): boolean
+	return self._running
+end
+
+-- True while the only "finger" is the mouse pointer.
+function TouchInput:IsMouseActive(): boolean
+	return self._mouseDown
+end
+
+function TouchInput:Start()
+	if self._running then
+		return
+	end
+	self._running = true
+
+	-- gameProcessedEvent is deliberately ignored: in edit mode Studio may
+	-- mark viewport touches as processed. Our own UI is filtered by isBlocked.
+	self._maid:Give(UserInputService.InputBegan:Connect(function(input)
+		self:_onBegan(input)
+	end))
+	self._maid:Give(UserInputService.InputChanged:Connect(function(input)
+		self:_onChanged(input)
+	end))
+	self._maid:Give(UserInputService.InputEnded:Connect(function(input)
+		self:_onEnded(input)
+	end))
+	-- Touches cancelled by the OS (e.g. a palm rejection) may skip InputEnded.
+	self._maid:Give(UserInputService.TouchEnded:Connect(function(input)
+		self:_onEnded(input)
+	end))
+
+	-- Optional events: missing ones (or ones Studio never fires) are simply skipped.
+	self:_connectOptional("WindowFocusReleased", function()
+		self:_releaseAll()
+	end)
+	self:_connectOptional("TouchPinch", function(positions, scale, _velocity, state)
+		self:_onPinch(positions, scale, state)
+	end)
+	self:_connectOptional("TouchPan", function()
+		self:_count("pan")
+	end)
+end
+
+function TouchInput:Stop()
+	if not self._running then
+		return
+	end
+	self._running = false
+	self._maid:Clean()
+	self:_releaseAll()
+	table.clear(self._down)
+end
+
+function TouchInput:_connectOptional(name: string, callback)
+	pcall(function()
+		self._maid:Give(UserInputService[name]:Connect(callback))
+	end)
+end
+
+function TouchInput:_count(key: string)
+	self.Stats[key] += 1
+	self.StatsChanged:Fire(self.Stats)
+end
+
+-- Forgets every finger without triggering taps or inertia.
+function TouchInput:_releaseAll()
+	for input in self._touches do
+		self.TouchEnded:Fire(input)
+	end
+	table.clear(self._touches)
+	self._mouseDown = false
+	self._pinchScale = nil
+	self._recognizer:Cancel()
+end
+
+-- If a finger finished without telling us, start over instead of mixing it
+-- into the next gesture (and without turning it into a tap).
+function TouchInput:_dropStaleTouches()
+	for input in self._touches do
+		local state = input.UserInputState
+		if state == Enum.UserInputState.End or state == Enum.UserInputState.Cancel then
+			self:_releaseAll()
+			return
+		end
+	end
+end
+
+local function isLeftButtonDown(): boolean
+	local ok, pressed = pcall(function()
+		return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+	end)
+	-- If Studio cannot tell, assume it is still held.
+	return not ok or pressed ~= false
+end
+
+function TouchInput:_onBegan(input: InputObject)
+	local inputType = input.UserInputType
+
+	if inputType == Enum.UserInputType.Touch then
+		self._lastTouchTime = os.clock()
+		self._down[input] = true
+		local fingers = 0
+		for _ in self._down do
+			fingers += 1
+		end
+		self.Stats.touchFingers = math.max(self.Stats.touchFingers, fingers)
+		self:_count("touchBegan")
+
+		if self._touches[input] then
+			-- The same InputObject began again: its previous end was lost.
+			self:_releaseAll()
+		end
+		local position = toVector2(input.Position)
+		if self._isBlocked(position) then
+			return
+		end
+		-- A real touch takes over from a mouse "finger" Windows synthesized from
+		-- it. Drop that one silently so it cannot count as a tap.
+		if self._mouseDown then
+			self._mouseDown = false
+			self._recognizer:Cancel()
+		end
+		self:_dropStaleTouches()
+		self._touches[input] = true
+		self.TouchBegan:Fire(input, position)
+		self._recognizer:TouchBegan(input, position)
+	elseif inputType == Enum.UserInputType.MouseButton1 then
+		self:_count("mouseDown")
+		if not self._mouseEnabled() or next(self._touches) then
+			return
+		end
+		if os.clock() - self._lastTouchTime < MOUSE_AFTER_TOUCH_COOLDOWN then
+			return
+		end
+		if self._mouseDown then
+			-- We never saw the previous release (e.g. it happened outside the
+			-- viewport). Forget that press instead of ignoring this one.
+			self._mouseDown = false
+			self._recognizer:Cancel()
+		end
+		local position = toVector2(input.Position)
+		if self._isBlocked(position) then
+			return
+		end
+		self._mouseDown = true
+		self._recognizer:TouchBegan(MOUSE_ID, position, MOUSE_TAP_SLOP)
+	end
+end
+
+function TouchInput:_onChanged(input: InputObject)
+	local inputType = input.UserInputType
+
+	if inputType == Enum.UserInputType.Touch then
+		self._lastTouchTime = os.clock()
+		self:_count("touchChanged")
+		if self._touches[input] then
+			local position = toVector2(input.Position)
+			self.TouchMoved:Fire(input, position)
+			self._recognizer:TouchMoved(input, position)
+		end
+	elseif inputType == Enum.UserInputType.MouseMovement then
+		self:_count("mouseMoves")
+		if self._mouseDown then
+			if not isLeftButtonDown() then
+				-- The button was released somewhere we could not see it.
+				self._mouseDown = false
+				self._recognizer:Cancel()
+				return
+			end
+			self._recognizer:TouchMoved(MOUSE_ID, toVector2(input.Position))
+		end
+	elseif inputType == Enum.UserInputType.MouseWheel then
+		self:_count("wheel")
+	end
+end
+
+function TouchInput:_onEnded(input: InputObject)
+	local inputType = input.UserInputType
+
+	if inputType == Enum.UserInputType.Touch then
+		self._lastTouchTime = os.clock()
+		if self._down[input] then
+			self._down[input] = nil
+			self:_count("touchEnded")
+		end
+		if self._touches[input] then
+			self._touches[input] = nil
+			self.TouchEnded:Fire(input)
+			self._recognizer:TouchEnded(input, toVector2(input.Position))
+		end
+	elseif inputType == Enum.UserInputType.MouseButton1 then
+		if self._mouseDown then
+			self._mouseDown = false
+			-- The button's InputObject may still hold the press position; keep the last move.
+			self._recognizer:TouchEnded(MOUSE_ID)
+		end
+	end
+end
+
+-- UserInputService.TouchPinch reports the total scale since the pinch began.
+function TouchInput:_onPinch(positions, scale: number, state: Enum.UserInputState)
+	self:_count("pinch")
+	-- Raw fingers already drive zoom whenever Studio reports two of them.
+	if self._recognizer:GetTouchCount() >= 2 or type(scale) ~= "number" or scale <= 0 then
+		self._pinchScale = nil
+		return
+	end
+
+	local centroid = nil
+	if type(positions) == "table" and #positions > 0 then
+		local sum = Vector2.zero
+		for _, position in positions do
+			sum += Vector2.new(position.X, position.Y)
+		end
+		centroid = sum / #positions
+	end
+
+	if state == Enum.UserInputState.End or state == Enum.UserInputState.Cancel then
+		self._pinchScale = nil
+		return
+	end
+	if state == Enum.UserInputState.Begin or self._pinchScale == nil then
+		-- Fingers on the plugin window must not zoom the camera.
+		if centroid and self._isBlocked(centroid) then
+			return
+		end
+		self._recognizer:Cancel()
+		self._pinchScale = scale
+		self.PinchBegan:Fire(centroid)
+		return
+	end
+
+	-- Spreading the fingers grows `scale`; the camera wants < 1 to move closer.
+	self.Pinch:Fire(self._pinchScale / scale, centroid)
+	self._pinchScale = scale
+end
+
+return TouchInput
+]]></ProtectedString>
+					</Properties>
+				</Item>
+			</Item>
+			<Item class="ModuleScript" referent="RBX10">
+				<Properties>
+					<string name="Name">Locale</string>
+					<ProtectedString name="Source"><![CDATA[--[[
+	UI strings in Polish and English.
+
+	The "auto" language picks Polish when Studio or the operating system runs
+	in Polish, English otherwise.
+]]
+
+local STRINGS = {
+	pl = {
+		buttonTooltip = "Sterowanie kamerą dotykiem",
+
+		statusOn = "Włączony",
+		statusPaused = "Wstrzymany",
+
+		tabGestures = "Gesty",
+		tabSettings = "Ustawienia",
+
+		actDrag = "Przeciągnij",
+		effDrag = "obraca kamerę",
+		actTapDrag = "Stuknij i przeciągnij",
+		effTapDrag = "przesuwa widok",
+		actStrip = "Suwak przy krawędzi",
+		effStrip = "przybliża i oddala",
+		actTap = "Stuknij",
+		effTap = "zaznacza obiekt",
+		actDoubleTap = "Stuknij dwa razy",
+		effDoubleTap = "ustawia kamerę na obiekcie",
+		actHold = "Przytrzymaj",
+		effHold = "dodaje do zaznaczenia albo usuwa",
+		actTwoFingers = "Dwa palce",
+		effTwoFingers = "zoom i przesuwanie, gdy Studio je widzi",
+
+		hudRotate = "Obrót",
+		hudZoom = "Zoom",
+		hudPan = "Przesuwanie",
+		hudBoth = "Zoom i przesuwanie",
+		noGesture = "brak",
+
+		toastSelected = "Zaznaczono: %s",
+		toastAdded = "Dodano: %s",
+		toastRemoved = "Odznaczono: %s",
+		toastCleared = "Zaznaczenie wyczyszczone",
+		toastFocused = "Kamera na: %s",
+		toastNothingToFocus = "Stuknij dwa razy w obiekt, żeby go pokazać",
+		toastPausedByTool = "Wstrzymano, bo wybrano inne narzędzie",
+		toastResumed = "Sterowanie dotykiem włączone",
+		toastSelectionItems = "%d obiektów",
+		toastMouseOnly = "Studio widzi dotyk jako mysz. Przesuwanie: stuknij i przeciągnij. Zoom: suwak z boku.",
+
+		groupSensitivity = "Czułość",
+		rotateSpeed = "Obrót",
+		zoomSpeed = "Zoom",
+		panSpeed = "Przesuwanie",
+
+		groupCamera = "Kamera",
+		rotateMode = "Obrót",
+		rotateModeOrbit = "Orbita",
+		rotateModeLook = "W miejscu",
+		inertia = "Bezwładność",
+		inertiaHint = "Kamera wyhamowuje po machnięciu",
+		invertRotate = "Odwróć obrót",
+		invertRotateHint = "Kamera kręci się w drugą stronę",
+		invertPan = "Odwróć przesuwanie",
+		invertPanHint = "Kamera leci tam, gdzie palec",
+		combineGestures = "Zoom i przesuwanie naraz",
+		combineGesturesHint = "Przy gestach dwoma palcami",
+
+		groupZoom = "Suwak zoomu",
+		showZoomStrip = "Pokazuj suwak",
+		showZoomStripHint = "Przy krawędzi widoku",
+		zoomSide = "Strona",
+		zoomSideLeft = "Lewa",
+		zoomSideRight = "Prawa",
+
+		groupSelection = "Zaznaczanie i widok",
+		selectModels = "Zaznaczaj całe modele",
+		selectModelsHint = "Tak jak kliknięcie w Studio",
+		showTouches = "Pokazuj dotyk",
+		showTouchesHint = "Okręgi pod palcami",
+		mouseInput = "Mysz i rysik",
+		mouseInputHint = "Działają jak jeden palec",
+		language = "Język",
+		languageAuto = "Auto",
+
+		groupDiagnostics = "Diagnostyka",
+		touchScreen = "Ekran dotykowy",
+		detected = "wykryty",
+		notDetected = "nie wykryto",
+		diagInput = "Ostatnie wejście",
+		inputTouch = "dotyk",
+		inputMouse = "mysz",
+		inputNone = "brak",
+		diagTouchEvents = "Zdarzenia dotyku",
+		diagTouchFingers = "Najwięcej palców naraz",
+		diagMouseClicks = "Kliknięcia myszą",
+		diagMouseMoves = "Ruchy myszy",
+		diagPinch = "Gesty szczypania",
+		version = "Wersja",
+		reset = "Przywróć domyślne",
+	},
+
+	en = {
+		buttonTooltip = "Touch camera controls",
+
+		statusOn = "On",
+		statusPaused = "Paused",
+
+		tabGestures = "Gestures",
+		tabSettings = "Settings",
+
+		actDrag = "Drag",
+		effDrag = "rotates the camera",
+		actTapDrag = "Tap, then drag",
+		effTapDrag = "pans the view",
+		actStrip = "Edge slider",
+		effStrip = "zooms in and out",
+		actTap = "Tap",
+		effTap = "selects an object",
+		actDoubleTap = "Double-tap",
+		effDoubleTap = "frames the object",
+		actHold = "Press and hold",
+		effHold = "adds to or removes from the selection",
+		actTwoFingers = "Two fingers",
+		effTwoFingers = "zoom and pan, when Studio sees both",
+
+		hudRotate = "Rotate",
+		hudZoom = "Zoom",
+		hudPan = "Pan",
+		hudBoth = "Zoom and pan",
+		noGesture = "none",
+
+		toastSelected = "Selected: %s",
+		toastAdded = "Added: %s",
+		toastRemoved = "Removed: %s",
+		toastCleared = "Selection cleared",
+		toastFocused = "Framed: %s",
+		toastNothingToFocus = "Double-tap an object to frame it",
+		toastPausedByTool = "Paused because another tool was picked",
+		toastResumed = "Touch controls on",
+		toastSelectionItems = "%d objects",
+		toastMouseOnly = "Studio sees touch as a mouse. Pan: tap, then drag. Zoom: the edge slider.",
+
+		groupSensitivity = "Sensitivity",
+		rotateSpeed = "Rotate",
+		zoomSpeed = "Zoom",
+		panSpeed = "Pan",
+
+		groupCamera = "Camera",
+		rotateMode = "Rotate",
+		rotateModeOrbit = "Orbit",
+		rotateModeLook = "In place",
+		inertia = "Inertia",
+		inertiaHint = "The camera glides after a flick",
+		invertRotate = "Invert rotation",
+		invertRotateHint = "The camera turns the other way",
+		invertPan = "Invert pan",
+		invertPanHint = "The camera moves with your finger",
+		combineGestures = "Zoom and pan together",
+		combineGesturesHint = "For two-finger gestures",
+
+		groupZoom = "Zoom slider",
+		showZoomStrip = "Show slider",
+		showZoomStripHint = "At the edge of the view",
+		zoomSide = "Side",
+		zoomSideLeft = "Left",
+		zoomSideRight = "Right",
+
+		groupSelection = "Selection and view",
+		selectModels = "Select whole models",
+		selectModelsHint = "Same as clicking in Studio",
+		showTouches = "Show touches",
+		showTouchesHint = "Rings under your fingers",
+		mouseInput = "Mouse and pen",
+		mouseInputHint = "Act as one finger",
+		language = "Language",
+		languageAuto = "Auto",
+
+		groupDiagnostics = "Diagnostics",
+		touchScreen = "Touch screen",
+		detected = "detected",
+		notDetected = "not detected",
+		diagInput = "Last input",
+		inputTouch = "touch",
+		inputMouse = "mouse",
+		inputNone = "none",
+		diagTouchEvents = "Touch events",
+		diagTouchFingers = "Most fingers at once",
+		diagMouseClicks = "Mouse clicks",
+		diagMouseMoves = "Mouse moves",
+		diagPinch = "Pinch gestures",
+		version = "Version",
+		reset = "Reset to defaults",
+	},
+}
+
+local GESTURE_KEYS = {
+	rotate = "hudRotate",
+	zoom = "hudZoom",
+	pan = "hudPan",
+	both = "hudBoth",
+}
+
+local function systemLanguage(): string
+	local ids = {}
+	pcall(function()
+		table.insert(ids, game:GetService("StudioService").StudioLocaleId)
+	end)
+	pcall(function()
+		table.insert(ids, game:GetService("LocalizationService").SystemLocaleId)
+	end)
+	for _, id in ids do
+		if type(id) == "string" and string.lower(string.sub(id, 1, 2)) == "pl" then
+			return "pl"
+		end
+	end
+	return "en"
+end
+
+local Locale = {}
+Locale.__index = Locale
+
+Locale.Strings = STRINGS
+
+function Locale.new(language: string?)
+	local self = setmetatable({}, Locale)
+	self:SetLanguage(language or "auto")
+	return self
+end
+
+function Locale:SetLanguage(language: string)
+	if language == "auto" or not STRINGS[language] then
+		language = systemLanguage()
+	end
+	self.language = language
+	self._strings = STRINGS[language]
+end
+
+function Locale:t(key: string, ...: any): string
+	local text = self._strings[key] or STRINGS.en[key] or key
+	if select("#", ...) > 0 then
+		return string.format(text, ...)
+	end
+	return text
+end
+
+-- Display name of a recognizer gesture ("rotate", "zoom", "pan", "both").
+function Locale:gesture(name: string?): string
+	return self:t(if name then GESTURE_KEYS[name] or "noGesture" else "noGesture")
+end
+
+return Locale
+]]></ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="Folder" referent="RBX11">
+				<Properties>
+					<string name="Name">Selection</string>
+				</Properties>
+				<Item class="ModuleScript" referent="RBX12">
+					<Properties>
+						<string name="Name">SelectionController</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Picks objects under a screen position and updates Studio's selection.
+
+	Mirrors Studio's click rules: locked and fully transparent parts are
+	skipped, terrain is not selectable, and (optionally) clicking a part inside
+	a model selects the whole top-level model.
+]]
+
+local Selection = game:GetService("Selection")
+local Workspace = game:GetService("Workspace")
+
+local Raycast = require(script.Parent.Parent.Camera.Raycast)
+
+local function isPickable(instance: Instance): boolean
+	if instance:IsA("Terrain") then
+		return true -- blocks the ray, but is not selectable (handled below)
+	end
+	if instance:IsA("BasePart") then
+		return not instance.Locked and instance.Transparency < 1
+	end
+	return false
+end
+
+local SelectionController = {}
+SelectionController.__index = SelectionController
+
+function SelectionController.new(settings)
+	local self = setmetatable({}, SelectionController)
+	self._settings = settings
+	return self
+end
+
+function SelectionController:_resolve(part: Instance): Instance
+	if not self._settings:Get("selectModels") then
+		return part
+	end
+	local target = part
+	local current = part.Parent
+	while current and current ~= Workspace do
+		if current:IsA("Model") then
+			target = current
+		end
+		current = current.Parent
+	end
+	return target
+end
+
+-- Returns the object a tap at `position` would select, or nil for empty space.
+function SelectionController:TargetAt(position: Vector2): Instance?
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+	local result = Raycast.fromScreen(camera, position, isPickable)
+	if not result or result.Instance:IsA("Terrain") then
+		return nil
+	end
+	return self:_resolve(result.Instance)
+end
+
+-- Replaces the selection with whatever is under `position` (or clears it).
+function SelectionController:SelectAt(position: Vector2): Instance?
+	local target = self:TargetAt(position)
+	Selection:Set(if target then { target } else {})
+	return target
+end
+
+-- Adds or removes the object under `position`. Returns the object and whether it is now selected.
+function SelectionController:ToggleAt(position: Vector2): (Instance?, boolean)
+	local target = self:TargetAt(position)
+	if not target then
+		return nil, false
+	end
+
+	local selected = Selection:Get()
+	local index = table.find(selected, target)
+	if index then
+		table.remove(selected, index)
+	else
+		table.insert(selected, target)
+	end
+	Selection:Set(selected)
+	return target, index == nil
+end
+
+function SelectionController:Get(): { Instance }
+	return Selection:Get()
+end
+
+function SelectionController:Set(instances: { Instance })
+	Selection:Set(instances)
+end
+
+return SelectionController
+]]></ProtectedString>
+					</Properties>
+				</Item>
+			</Item>
+			<Item class="ModuleScript" referent="RBX13">
+				<Properties>
+					<string name="Name">Settings</string>
+					<ProtectedString name="Source"><![CDATA[--[[
+	Persistent plugin settings backed by plugin:GetSetting / plugin:SetSetting.
+
+	`store` is anything with GetSetting/SetSetting (the plugin object in Studio,
+	or nil for an in-memory store in tests).
+]]
+
+local Signal = require(script.Parent.Util.Signal)
+
+local PREFIX = "TouchPeak_"
+
+local DEFAULTS = {
+	rotateSensitivity = 1,
+	zoomSensitivity = 1,
+	panSensitivity = 1,
+	rotateMode = "orbit", -- "orbit" around what you look at, or "look" around in place
+	inertia = true,
+	combineGestures = false,
+	invertRotate = false,
+	invertPan = false,
+	selectModels = true,
+	showTouches = true,
+	mouseInput = true,
+	showZoomStrip = true,
+	zoomSide = "left", -- which edge of the viewport the zoom strip sits on
+	language = "auto", -- "auto" | "pl" | "en"
+}
+
+local CHOICES = {
+	rotateMode = { orbit = true, look = true },
+	zoomSide = { left = true, right = true },
+	language = { auto = true, pl = true, en = true },
+}
+
+local SENSITIVITY_RANGE = { min = 0.25, max = 3 }
+
+local Settings = {}
+Settings.__index = Settings
+
+Settings.Defaults = DEFAULTS
+Settings.SensitivityRange = SENSITIVITY_RANGE
+
+local function sanitize(key: string, value: any): any
+	local default = DEFAULTS[key]
+	if value == nil or typeof(value) ~= typeof(default) then
+		return default
+	end
+	if CHOICES[key] and not CHOICES[key][value] then
+		return default
+	end
+	if typeof(default) == "number" then
+		if value ~= value then -- NaN
+			return default
+		end
+		return math.clamp(value, SENSITIVITY_RANGE.min, SENSITIVITY_RANGE.max)
+	end
+	return value
+end
+
+function Settings.new(store)
+	local self = setmetatable({}, Settings)
+	self._store = store
+	self._values = {}
+	self.Changed = Signal.new()
+
+	for key in DEFAULTS do
+		self._values[key] = sanitize(key, self:_read(key))
+	end
+
+	return self
+end
+
+function Settings:_read(key: string): any
+	if not self._store then
+		return nil
+	end
+	local ok, value = pcall(self._store.GetSetting, self._store, PREFIX .. key)
+	return if ok then value else nil
+end
+
+function Settings:_write(key: string, value: any)
+	if self._store then
+		pcall(self._store.SetSetting, self._store, PREFIX .. key, value)
+	end
+end
+
+function Settings:Get(key: string): any
+	assert(DEFAULTS[key] ~= nil, `Unknown setting "{key}"`)
+	return self._values[key]
+end
+
+function Settings:Set(key: string, value: any)
+	assert(DEFAULTS[key] ~= nil, `Unknown setting "{key}"`)
+	value = sanitize(key, value)
+	if self._values[key] == value then
+		return
+	end
+	self._values[key] = value
+	self:_write(key, value)
+	self.Changed:Fire(key, value)
+end
+
+function Settings:Reset()
+	for key, default in DEFAULTS do
+		self:Set(key, default)
+	end
+end
+
+-- UI state (panel position, last tab, ...) that is remembered but is not a user preference.
+function Settings:GetState(key: string): any
+	return self:_read("State_" .. key)
+end
+
+function Settings:SetState(key: string, value: any)
+	self:_write("State_" .. key, value)
+end
+
+return Settings
+]]></ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="Folder" referent="RBX14">
+				<Properties>
+					<string name="Name">UI</string>
+				</Properties>
+				<Item class="ModuleScript" referent="RBX15">
+					<Properties>
+						<string name="Name">Components</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Touch friendly controls in the plugin's monochrome style: recessed
+	"wells" for tracks, raised "ridges" for whatever is selected, bone white
+	for "on". Each constructor returns a table with `instance` plus a `set`
+	function to update it from code.
+]]
+
+local TextService = game:GetService("TextService")
+
+local Theme = require(script.Parent.Theme)
+local Create = require(script.Parent.Create)
+
+local Color = Theme.Color
+local Font = Theme.Font
+local Radius = Theme.Radius
+
+local Components = {}
+
+-- Width of a single line of Builder Sans Medium text.
+local function textWidth(text: string, size: number): number
+	local ok, bounds = pcall(function()
+		return TextService:GetTextSize(text, size, Enum.Font.BuilderSansMedium, Vector2.new(1000, 100))
+	end)
+	if ok and typeof(bounds) == "Vector2" and bounds.X > 0 then
+		return math.ceil(bounds.X)
+	end
+	return math.ceil((utf8.len(text) or #text) * size * 0.5)
+end
+
+local function isPointer(input: InputObject): boolean
+	local inputType = input.UserInputType
+	return inputType == Enum.UserInputType.MouseButton1 or inputType == Enum.UserInputType.Touch
+end
+
+-- Shows a button's background while hovered (mouse) or pressed (mouse or touch).
+function Components.pressable(button: GuiButton, restTransparency: number, activeTransparency: number)
+	local hovering = false
+	local function refresh(pressed: boolean?)
+		local goal = if pressed or hovering then activeTransparency else restTransparency
+		Create.tween(button, Theme.Tween.Fast, { BackgroundTransparency = goal })
+	end
+	button.MouseEnter:Connect(function()
+		hovering = true
+		refresh()
+	end)
+	button.MouseLeave:Connect(function()
+		hovering = false
+		refresh()
+	end)
+	button.InputBegan:Connect(function(input)
+		if isPointer(input) then
+			refresh(true)
+		end
+	end)
+	button.InputEnded:Connect(function(input)
+		if isPointer(input) then
+			if input.UserInputType == Enum.UserInputType.Touch then
+				hovering = false
+			end
+			refresh()
+		end
+	end)
+end
+
+local function bar(width: number, height: number, rotation: number?, position: UDim2?, color: Color3?): Frame
+	return Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = position or UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(width, height),
+		Rotation = rotation or 0,
+		BackgroundColor3 = color or Color.Ash,
+	}, { Create.round() })
+end
+Components.bar = bar
+
+local function glyphFrame(size: number, children): Frame
+	return Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(size, size),
+		BackgroundTransparency = 1,
+	}, children)
+end
+
+function Components.CloseGlyph(): Frame
+	return glyphFrame(14, {
+		A = bar(13, 2, 45),
+		B = bar(13, 2, -45),
+	})
+end
+
+-- An upward chevron; rotate the returned frame 180 degrees to point it down.
+function Components.ChevronGlyph(): Frame
+	return glyphFrame(14, {
+		Left = bar(8, 2, -45, UDim2.new(0.5, -2.5, 0.5, 0)),
+		Right = bar(8, 2, 45, UDim2.new(0.5, 2.5, 0.5, 0)),
+	})
+end
+
+-- A borderless square button that only shows a background when touched or hovered.
+function Components.IconButton(props: { glyph: GuiObject, onActivated: () -> () })
+	local button = Create("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Size = UDim2.fromOffset(30, 30),
+		BackgroundColor3 = Color.Ridge,
+		BackgroundTransparency = 1,
+		ZIndex = 3,
+	}, {
+		Create.corner(Radius.Control),
+		Glyph = props.glyph,
+	})
+	Components.pressable(button, 1, 0)
+	button.Activated:Connect(props.onActivated)
+	return { instance = button }
+end
+
+-- A slide switch. Off: knob in a dark well. On: the track fills with bone white.
+function Components.Switch(props: { value: boolean, onChanged: (boolean) -> () })
+	local value = props.value
+
+	local knob = Create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Size = UDim2.fromOffset(16, 16),
+		BackgroundColor3 = Color.Ash,
+		ZIndex = 2,
+	}, { Create.round() })
+
+	local stroke = Create.stroke(Color.Bone, 0.86)
+	local track = Create("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Size = UDim2.fromOffset(40, 22),
+		BackgroundColor3 = Color.Well,
+		BackgroundTransparency = 0,
+	}, {
+		Create.round(),
+		Stroke = stroke,
+		Knob = knob,
+	})
+
+	local api = { instance = track }
+
+	function api.set(newValue: boolean, instant: boolean?)
+		value = newValue
+		local info = if instant then nil else Theme.Tween.Smooth
+		Create.animate(track, info, { BackgroundColor3 = if value then Color.Bone else Color.Well })
+		Create.animate(stroke, info, { Transparency = if value then 1 else 0.86 })
+		Create.animate(knob, info, {
+			Position = UDim2.new(0, if value then 21 else 3, 0.5, 0),
+			BackgroundColor3 = if value then Color.Graphite else Color.Ash,
+		})
+	end
+
+	track.Activated:Connect(function()
+		api.set(not value)
+		props.onChanged(value)
+	end)
+
+	api.set(value, true)
+	return api
+end
+
+local function formatMultiplier(value: number): string
+	local text = string.format("%.2f", value)
+	text = string.gsub(text, "0$", "")
+	return text .. "×"
+end
+
+function Components.Stepper(props: {
+	value: number,
+	min: number,
+	max: number,
+	step: number,
+	onChanged: (number) -> (),
+})
+	local value = props.value
+
+	local function stepButton(isPlus: boolean, anchor: Vector2, position: UDim2)
+		local button = Create("TextButton", {
+			AnchorPoint = anchor,
+			Position = position,
+			Size = UDim2.fromOffset(28, 28),
+			BackgroundColor3 = Color.Ridge,
+			BackgroundTransparency = 1,
+		}, {
+			Create.corner(Radius.Control),
+			Glyph = glyphFrame(12, {
+				H = bar(10, 2, 0, nil, Color.Bone),
+				V = if isPlus then bar(2, 10, 0, nil, Color.Bone) else nil,
+			}),
+		})
+		Components.pressable(button, 1, 0)
+		return button
+	end
+
+	local minus = stepButton(false, Vector2.new(0, 0.5), UDim2.fromScale(0, 0.5))
+	local plus = stepButton(true, Vector2.new(1, 0.5), UDim2.fromScale(1, 0.5))
+	local label = Create("TextLabel", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(1, -56, 1, 0),
+		FontFace = Font.SemiBold,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	})
+
+	local container = Create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Size = UDim2.fromOffset(104, 28),
+		BackgroundColor3 = Color.Well,
+	}, {
+		Create.corner(Radius.Control),
+		Minus = minus,
+		Plus = plus,
+		Value = label,
+	})
+
+	local api = { instance = container }
+
+	local function dim(button: GuiButton, disabled: boolean)
+		for _, part in button.Glyph:GetChildren() do
+			part.BackgroundColor3 = if disabled then Color.Dim else Color.Bone
+		end
+	end
+
+	function api.set(newValue: number)
+		value = math.clamp(newValue, props.min, props.max)
+		label.Text = formatMultiplier(value)
+		dim(minus, value <= props.min)
+		dim(plus, value >= props.max)
+	end
+
+	local function change(direction: number)
+		local newValue = math.clamp(value + direction * props.step, props.min, props.max)
+		-- Avoid floating point drift (0.1 + 0.2 ...).
+		newValue = math.round(newValue / props.step) * props.step
+		if newValue ~= value then
+			api.set(newValue)
+			props.onChanged(value)
+		end
+	end
+
+	minus.Activated:Connect(function()
+		change(-1)
+	end)
+	plus.Activated:Connect(function()
+		change(1)
+	end)
+
+	api.set(value)
+	return api
+end
+
+-- A small choice control: the chosen option sits raised inside a dark well.
+function Components.Segmented(props: {
+	options: { { id: string, label: string } },
+	value: string,
+	onChanged: (string) -> (),
+	width: number,
+})
+	local count = #props.options
+	local value = props.value
+
+	local highlight = Create("Frame", {
+		Size = UDim2.new(1 / count, -4, 1, -4),
+		BackgroundColor3 = Color.Ridge,
+	}, { Create.corner(Radius.Control - 2) })
+
+	local container = Create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Size = UDim2.fromOffset(props.width, 28),
+		BackgroundColor3 = Color.Well,
+	}, {
+		Create.corner(Radius.Control),
+		Highlight = highlight,
+	})
+
+	local api = { instance = container }
+	local buttons = {}
+
+	function api.set(id: string, instant: boolean?)
+		local entry = buttons[id]
+		if not entry then
+			return
+		end
+		value = id
+		local info = if instant then nil else Theme.Tween.Smooth
+		Create.animate(highlight, info, { Position = UDim2.new((entry.index - 1) / count, 2, 0, 2) })
+		for optionId, other in buttons do
+			Create.animate(other.button, info, {
+				TextColor3 = if optionId == id then Color.Bone else Color.Ash,
+			})
+		end
+	end
+
+	for index, option in props.options do
+		local button = Create("TextButton", {
+			Position = UDim2.fromScale((index - 1) / count, 0),
+			Size = UDim2.fromScale(1 / count, 1),
+			Text = option.label,
+			FontFace = Font.Medium,
+			TextSize = 13,
+			TextColor3 = Color.Ash,
+			ZIndex = 2,
+			Parent = container,
+		})
+		buttons[option.id] = { button = button, index = index }
+		button.Activated:Connect(function()
+			if value ~= option.id then
+				api.set(option.id)
+				props.onChanged(option.id)
+			end
+		end)
+	end
+
+	api.set(value, true)
+	return api
+end
+
+-- Text tabs with a short bone underline that slides to the chosen tab.
+function Components.Tabs(props: {
+	options: { { id: string, label: string } },
+	value: string,
+	onChanged: (string) -> (),
+})
+	local value = props.value
+	local container = Create("Frame", {
+		Size = UDim2.new(1, 0, 0, Theme.Size.Tabs),
+		BackgroundTransparency = 1,
+	})
+	local underline = Create("Frame", {
+		AnchorPoint = Vector2.new(0, 1),
+		Size = UDim2.fromOffset(0, 2),
+		BackgroundColor3 = Color.Bone,
+		Parent = container,
+	}, { Create.round() })
+
+	local api = { instance = container }
+	local buttons = {}
+	local x = 0
+
+	function api.set(id: string, instant: boolean?)
+		local entry = buttons[id]
+		if not entry then
+			return
+		end
+		value = id
+		local info = if instant then nil else Theme.Tween.Smooth
+		Create.animate(underline, info, {
+			Position = UDim2.new(0, entry.x, 1, -1),
+			Size = UDim2.fromOffset(entry.width, 2),
+		})
+		for optionId, other in buttons do
+			Create.animate(other.button, info, {
+				TextColor3 = if optionId == id then Color.Bone else Color.Ash,
+			})
+		end
+	end
+
+	for _, option in props.options do
+		local width = textWidth(option.label, 15)
+		local button = Create("TextButton", {
+			Position = UDim2.fromOffset(x, 0),
+			Size = UDim2.new(0, width, 1, -2),
+			Text = option.label,
+			FontFace = Font.Medium,
+			TextSize = 15,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextColor3 = Color.Ash,
+			Parent = container,
+		})
+		buttons[option.id] = { button = button, x = x, width = width }
+		x += width + 20
+		button.Activated:Connect(function()
+			if value ~= option.id then
+				api.set(option.id)
+				props.onChanged(option.id)
+			end
+		end)
+	end
+
+	api.set(value, true)
+	return api
+end
+
+-- Heading for a group of settings: sentence case, a touch heavier than rows.
+function Components.GroupTitle(text: string): TextLabel
+	return Create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 38),
+		Text = text,
+		FontFace = Font.SemiBold,
+		TextSize = 13,
+		TextColor3 = Color.Ash,
+		TextYAlignment = Enum.TextYAlignment.Bottom,
+	}, {
+		Create.padding(0, 0, 8, 0),
+	})
+end
+
+-- A list row: title, optional hint underneath, control on the right, hairline below.
+function Components.Row(props: {
+	title: string,
+	hint: string?,
+	control: GuiObject?,
+	controlWidth: number?,
+})
+	local hasHint = props.hint ~= nil
+	local reserved = (props.controlWidth or 0) + 12
+
+	local row = Create("Frame", {
+		Size = UDim2.new(1, 0, 0, if hasHint then 52 else 42),
+		BackgroundTransparency = 1,
+	}, {
+		Title = Create("TextLabel", {
+			Position = UDim2.fromOffset(0, if hasHint then 8 else 0),
+			Size = UDim2.new(1, -reserved, 0, if hasHint then 20 else 42),
+			Text = props.title,
+			TextSize = 14,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		}),
+		Hint = if hasHint
+			then Create("TextLabel", {
+				Position = UDim2.fromOffset(0, 28),
+				Size = UDim2.new(1, -reserved, 0, 16),
+				Text = props.hint,
+				TextSize = 12,
+				TextColor3 = Color.Ash,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+			})
+			else nil,
+		Rule = Create("Frame", {
+			AnchorPoint = Vector2.new(0, 1),
+			Position = UDim2.fromScale(0, 1),
+			Size = UDim2.new(1, 0, 0, 1),
+			BackgroundColor3 = Color.Bone,
+			BackgroundTransparency = 0.94,
+		}),
+	})
+
+	if props.control then
+		props.control.AnchorPoint = Vector2.new(1, 0.5)
+		props.control.Position = UDim2.fromScale(1, 0.5)
+		props.control.Parent = row
+	end
+
+	return row
+end
+
+-- A read-only row with a value on the right (diagnostics).
+function Components.ValueRow(title: string): (Frame, TextLabel)
+	local value = Create("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.fromScale(1, 0),
+		Size = UDim2.new(0.45, 0, 1, 0),
+		FontFace = Font.Medium,
+		TextSize = 13,
+		TextColor3 = Color.Bone,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	})
+	local row = Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 30),
+		BackgroundTransparency = 1,
+	}, {
+		Title = Create("TextLabel", {
+			Size = UDim2.new(0.55, 0, 1, 0),
+			Text = title,
+			TextSize = 13,
+			TextColor3 = Color.Ash,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		}),
+		Value = value,
+	})
+	return row, value
+end
+
+function Components.Button(props: { text: string, onActivated: () -> () })
+	local button = Create("TextButton", {
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundColor3 = Color.Ridge,
+		BackgroundTransparency = 0.3,
+		Text = props.text,
+		TextSize = 14,
+	}, {
+		Create.corner(Radius.Control),
+	})
+	Components.pressable(button, 0.3, 0)
+	button.Activated:Connect(props.onActivated)
+	return { instance = button }
+end
+
+return Components
+]]></ProtectedString>
+					</Properties>
+				</Item>
+				<Item class="ModuleScript" referent="RBX16">
+					<Properties>
+						<string name="Name">Create</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Tiny declarative instance builder:
+
+		Create("Frame", { Size = ... }, {
+			Create.corner(12),
+			Label = Create("TextLabel", { Text = "Hi" }),
+		})
+
+	String keys in the children table become the child's Name.
+]]
+
+local TweenService = game:GetService("TweenService")
+
+local Theme = require(script.Parent.Theme)
+
+local DEFAULTS = {
+	Frame = { BorderSizePixel = 0 },
+	ScrollingFrame = {
+		BorderSizePixel = 0,
+		BackgroundTransparency = 1,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = Theme.Color.Bone,
+		ScrollBarImageTransparency = 0.8,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		CanvasSize = UDim2.new(),
+		ElasticBehavior = Enum.ElasticBehavior.Always,
+	},
+	TextLabel = {
+		BorderSizePixel = 0,
+		BackgroundTransparency = 1,
+		FontFace = Theme.Font.Regular,
+		TextColor3 = Theme.Color.Bone,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	},
+	TextButton = {
+		BorderSizePixel = 0,
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		FontFace = Theme.Font.Medium,
+		TextColor3 = Theme.Color.Bone,
+		TextSize = 14,
+		Text = "",
+	},
+}
+
+local Create = {}
+
+local function create(className: string, props: { [string]: any }?, children: { [any]: Instance }?): Instance
+	local instance = Instance.new(className)
+
+	local defaults = DEFAULTS[className]
+	if defaults then
+		for key, value in defaults do
+			instance[key] = value
+		end
+	end
+
+	local parent = nil
+	for key, value in props or {} do
+		if key == "Parent" then
+			parent = value
+		else
+			instance[key] = value
+		end
+	end
+
+	for key, child in children or {} do
+		if type(key) == "string" then
+			child.Name = key
+		end
+		child.Parent = instance
+	end
+
+	if parent then
+		instance.Parent = parent
+	end
+	return instance
+end
+
+setmetatable(Create, {
+	__call = function(_, className, props, children)
+		return create(className, props, children)
+	end,
+})
+
+function Create.corner(radius: number): UICorner
+	return create("UICorner", { CornerRadius = UDim.new(0, radius) })
+end
+
+function Create.round(): UICorner
+	return create("UICorner", { CornerRadius = UDim.new(1, 0) })
+end
+
+function Create.stroke(color: Color3?, transparency: number?, thickness: number?): UIStroke
+	return create("UIStroke", {
+		Color = color or Theme.Color.Bone,
+		Transparency = transparency or 0.9,
+		Thickness = thickness or 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	})
+end
+
+function Create.padding(top: number, right: number?, bottom: number?, left: number?): UIPadding
+	right = right or top
+	return create("UIPadding", {
+		PaddingTop = UDim.new(0, top),
+		PaddingRight = UDim.new(0, right),
+		PaddingBottom = UDim.new(0, bottom or top),
+		PaddingLeft = UDim.new(0, left or right),
+	})
+end
+
+function Create.list(padding: number, direction: Enum.FillDirection?): UIListLayout
+	return create("UIListLayout", {
+		Padding = UDim.new(0, padding),
+		FillDirection = direction or Enum.FillDirection.Vertical,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		VerticalAlignment = Enum.VerticalAlignment.Top,
+	})
+end
+
+-- A filled circle centred on `position`.
+function Create.dot(size: number, color: Color3, position: UDim2?): Frame
+	return create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = position or UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(size, size),
+		BackgroundColor3 = color,
+	}, { Create.round() })
+end
+
+-- An outlined circle centred on `position`.
+function Create.ring(size: number, color: Color3, transparency: number, thickness: number, position: UDim2?): Frame
+	return create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = position or UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(size, size),
+		BackgroundTransparency = 1,
+	}, {
+		Create.round(),
+		Stroke = Create.stroke(color, transparency, thickness),
+	})
+end
+
+function Create.tween(instance: Instance, info: TweenInfo, goal: { [string]: any }): Tween
+	local tween = TweenService:Create(instance, info, goal)
+	tween:Play()
+	return tween
+end
+
+-- Tweens to `goal`, or applies it immediately when `info` is nil.
+function Create.animate(instance: Instance, info: TweenInfo?, goal: { [string]: any })
+	if info then
+		Create.tween(instance, info, goal)
+	else
+		for key, value in goal do
+			instance[key] = value
+		end
+	end
+end
+
+return Create
+]]></ProtectedString>
+					</Properties>
+				</Item>
+				<Item class="ModuleScript" referent="RBX17">
+					<Properties>
+						<string name="Name">GestureIcons</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Small static glyphs for the gesture legend, drawn with frames only.
+	Camera moves use their axis colour (see Theme.GestureColor); selection
+	gestures stay bone white.
+]]
+
+local Theme = require(script.Parent.Theme)
+local Create = require(script.Parent.Create)
+
+local Color = Theme.Color
+
+local function canvas(): Frame
+	return Create("Frame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+	})
+end
+
+local function line(from: Vector2, to: Vector2, color: Color3, transparency: number?): Frame
+	local offset = to - from
+	local middle = (from + to) / 2
+	return Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, middle.X, 0.5, middle.Y),
+		Size = UDim2.fromOffset(offset.Magnitude, 2),
+		Rotation = math.deg(math.atan2(offset.Y, offset.X)),
+		BackgroundColor3 = color,
+		BackgroundTransparency = transparency or 0,
+	}, { Create.round() })
+end
+
+local function at(x: number, y: number): UDim2
+	return UDim2.new(0.5, x, 0.5, y)
+end
+
+local Icons = {}
+
+-- Drag: a finger travelling along an orbit.
+function Icons.drag()
+	local icon = canvas()
+	Create.ring(20, Color.Green, 0.35, 2).Parent = icon
+	Create.dot(7, Color.Green, at(7, -7)).Parent = icon
+	return icon
+end
+
+-- Tap, then drag: the tap mark and the finger sliding away from it.
+function Icons.tapDrag()
+	local icon = canvas()
+	Create.ring(9, Color.Red, 0.3, 1.5, at(-7, 0)).Parent = icon
+	line(Vector2.new(-2, 0), Vector2.new(6, 0), Color.Red).Parent = icon
+	Create.dot(7, Color.Red, at(8, 0)).Parent = icon
+	return icon
+end
+
+-- The zoom strip at the screen edge, with its index notch.
+function Icons.strip()
+	local icon = canvas()
+	Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = at(-2, 0),
+		Size = UDim2.fromOffset(10, 22),
+		BackgroundTransparency = 1,
+		Parent = icon,
+	}, {
+		Create.corner(3),
+		Create.stroke(Color.Blue, 0.3, 1.5),
+	})
+	for _, y in { -6, 0, 6 } do
+		line(Vector2.new(-4, y), Vector2.new(0, y), Color.Blue, if y == 0 then 0 else 0.5).Parent = icon
+	end
+	line(Vector2.new(5, 0), Vector2.new(9, 0), Color.Blue).Parent = icon
+	return icon
+end
+
+function Icons.tap()
+	local icon = canvas()
+	Create.ring(16, Color.Bone, 0.6, 1.5).Parent = icon
+	Create.dot(6, Color.Bone).Parent = icon
+	return icon
+end
+
+function Icons.doubleTap()
+	local icon = canvas()
+	Create.ring(22, Color.Bone, 0.75, 1.5).Parent = icon
+	Create.ring(13, Color.Bone, 0.45, 1.5).Parent = icon
+	Create.dot(6, Color.Bone).Parent = icon
+	return icon
+end
+
+function Icons.hold()
+	local icon = canvas()
+	Create.ring(20, Color.Bone, 0.2, 2).Parent = icon
+	Create.dot(10, Color.Bone).Parent = icon
+	return icon
+end
+
+function Icons.twoFingers()
+	local icon = canvas()
+	line(Vector2.new(-6, 6), Vector2.new(6, -6), Color.Bone, 0.7).Parent = icon
+	Create.dot(7, Color.Bone, at(-7, 7)).Parent = icon
+	Create.dot(7, Color.Bone, at(7, -7)).Parent = icon
+	return icon
+end
+
+return Icons
+]]></ProtectedString>
+					</Properties>
+				</Item>
+				<Item class="ModuleScript" referent="RBX18">
+					<Properties>
+						<string name="Name">Overlay</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Viewport feedback drawn on top of the 3D view:
+	  * a thin ring under each finger, tinted with the colour of the camera
+	    move it is driving (and a line joining two fingers),
+	  * a ring that expands where you tap,
+	  * a tag at the bottom naming the move in progress,
+	  * short notes at the top ("Selected: Part").
+]]
+
+local Theme = require(script.Parent.Theme)
+local Create = require(script.Parent.Create)
+local Maid = require(script.Parent.Parent.Util.Maid)
+
+local Color = Theme.Color
+local Font = Theme.Font
+
+local TOUCH_SIZE = 46
+local NOTE_TIME = 1.6
+
+local Overlay = {}
+Overlay.__index = Overlay
+
+-- A small dark tag with a coloured notch on its left edge; fades in and out.
+local function makeTag(parent: Instance, anchor: Vector2, position: UDim2)
+	local notch = Create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, -9, 0.5, 0),
+		Size = UDim2.new(0, 3, 1, -12),
+		BackgroundColor3 = Color.Bone,
+		BackgroundTransparency = 1,
+	}, { Create.round() })
+
+	local label = Create("TextLabel", {
+		Size = UDim2.fromScale(0, 1),
+		AutomaticSize = Enum.AutomaticSize.X,
+		FontFace = Font.Medium,
+		TextSize = 14,
+		TextTransparency = 1,
+	})
+
+	local tag = Create("Frame", {
+		AnchorPoint = anchor,
+		Position = position,
+		Size = UDim2.fromOffset(0, 32),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = Color.Graphite,
+		BackgroundTransparency = 1,
+		Visible = false,
+		Parent = parent,
+	}, {
+		Create.corner(Theme.Radius.Tag),
+		Create.padding(0, 12, 0, 19),
+		Notch = notch,
+		Label = label,
+	})
+
+	local api = {}
+	local token = 0
+
+	function api.show(text: string, color: Color3?)
+		token += 1
+		label.Text = text
+		notch.BackgroundColor3 = color or Color.Bone
+		tag.Visible = true
+		Create.tween(tag, Theme.Tween.Fast, { BackgroundTransparency = 0.04 })
+		Create.tween(label, Theme.Tween.Fast, { TextTransparency = 0 })
+		Create.tween(notch, Theme.Tween.Fast, { BackgroundTransparency = 0 })
+	end
+
+	function api.hide()
+		token += 1
+		local myToken = token
+		Create.tween(tag, Theme.Tween.Smooth, { BackgroundTransparency = 1 })
+		Create.tween(label, Theme.Tween.Smooth, { TextTransparency = 1 })
+		Create.tween(notch, Theme.Tween.Smooth, { BackgroundTransparency = 1 })
+		task.delay(Theme.Tween.Smooth.Time, function()
+			if token == myToken then
+				tag.Visible = false
+			end
+		end)
+	end
+
+	function api.flash(text: string, color: Color3?, duration: number)
+		api.show(text, color)
+		local myToken = token
+		task.delay(duration, function()
+			if token == myToken then
+				api.hide()
+			end
+		end)
+	end
+
+	return api
+end
+
+function Overlay.new(parent: Instance, settings)
+	local self = setmetatable({}, Overlay)
+	self._settings = settings
+	self._maid = Maid.new()
+	self._touches = {} -- id -> { frame, position }
+	self._touchColor = Color.Bone
+
+	self._root = self._maid:Give(Create("Frame", {
+		Name = "TouchPeakOverlay",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		ZIndex = 1,
+		Parent = parent,
+	}))
+
+	self._link = Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Size = UDim2.fromOffset(0, 1),
+		BackgroundColor3 = Color.Bone,
+		BackgroundTransparency = 0.45,
+		Visible = false,
+		Parent = self._root,
+	})
+
+	self._gestureTag = makeTag(self._root, Vector2.new(0.5, 1), UDim2.new(0.5, 0, 1, -22))
+	self._note = makeTag(self._root, Vector2.new(0.5, 0), UDim2.new(0.5, 0, 0, 16))
+
+	return self
+end
+
+-- Finger rings -----------------------------------------------------------------------
+
+function Overlay:TouchBegan(id: any, position: Vector2)
+	if not self._settings:Get("showTouches") or self._touches[id] then
+		return
+	end
+
+	local scale = Create("UIScale", { Scale = 0.6 })
+	local frame = Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromOffset(position.X, position.Y),
+		Size = UDim2.fromOffset(TOUCH_SIZE, TOUCH_SIZE),
+		BackgroundTransparency = 1,
+		ZIndex = 2,
+		Parent = self._root,
+	}, {
+		Create.round(),
+		Stroke = Create.stroke(self._touchColor, 0.1, 2),
+		Core = Create.dot(6, Color.Bone),
+		Scale = scale,
+	})
+	Create.tween(scale, Theme.Tween.Smooth, { Scale = 1 })
+
+	self._touches[id] = { frame = frame, position = position }
+	self:_updateLink()
+end
+
+function Overlay:TouchMoved(id: any, position: Vector2)
+	local touch = self._touches[id]
+	if not touch then
+		return
+	end
+	touch.position = position
+	touch.frame.Position = UDim2.fromOffset(position.X, position.Y)
+	self:_updateLink()
+end
+
+function Overlay:TouchEnded(id: any)
+	local touch = self._touches[id]
+	if not touch then
+		return
+	end
+	self._touches[id] = nil
+	self:_updateLink()
+
+	local frame = touch.frame
+	Create.tween(frame.Scale, Theme.Tween.Smooth, { Scale = 1.25 })
+	Create.tween(frame.Stroke, Theme.Tween.Smooth, { Transparency = 1 })
+	Create.tween(frame.Core, Theme.Tween.Smooth, { BackgroundTransparency = 1 })
+	task.delay(Theme.Tween.Smooth.Time, function()
+		frame:Destroy()
+	end)
+end
+
+function Overlay:_updateLink()
+	local points = {}
+	for _, touch in self._touches do
+		table.insert(points, touch.position)
+	end
+
+	if #points ~= 2 then
+		self._link.Visible = false
+		return
+	end
+
+	local a, b = points[1], points[2]
+	local offset = b - a
+	local middle = (a + b) / 2
+	self._link.Visible = true
+	self._link.Position = UDim2.fromOffset(middle.X, middle.Y)
+	self._link.Size = UDim2.fromOffset(offset.Magnitude, 1)
+	self._link.Rotation = math.deg(math.atan2(offset.Y, offset.X))
+end
+
+-- A ring that expands where a tap landed.
+function Overlay:Ripple(position: Vector2, color: Color3?)
+	if not self._settings:Get("showTouches") then
+		return
+	end
+	local ring = Create.ring(12, color or Color.Bone, 0.1, 1.5, UDim2.fromOffset(position.X, position.Y))
+	ring.ZIndex = 2
+	ring.Parent = self._root
+
+	local info = TweenInfo.new(0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+	Create.tween(ring, info, { Size = UDim2.fromOffset(58, 58) })
+	Create.tween(ring.Stroke, info, { Transparency = 1 })
+	task.delay(info.Time, function()
+		ring:Destroy()
+	end)
+end
+
+-- Tags --------------------------------------------------------------------------------
+
+-- Names the camera move in progress and tints the finger rings with its colour.
+function Overlay:ShowGesture(text: string?, color: Color3?)
+	self._touchColor = color or Color.Bone
+	for _, touch in self._touches do
+		Create.tween(touch.frame.Stroke, Theme.Tween.Fast, { Color = self._touchColor })
+	end
+	if text then
+		self._gestureTag.show(text, color)
+	else
+		self._gestureTag.hide()
+	end
+end
+
+function Overlay:Toast(text: string, color: Color3?)
+	self._note.flash(text, color, NOTE_TIME)
+end
+
+function Overlay:HideToast()
+	self._note.hide()
+end
+
+function Overlay:ClearTouches()
+	for id in table.clone(self._touches) do
+		self:TouchEnded(id)
+	end
+end
+
+function Overlay:Destroy()
+	self._touches = {}
+	self._maid:Clean()
+end
+
+return Overlay
+]]></ProtectedString>
+					</Properties>
+				</Item>
+				<Item class="ModuleScript" referent="RBX19">
+					<Properties>
+						<string name="Name">Panel</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	The floating Touch Peak window drawn over the viewport.
+
+	  * Header: the peak logo (its summit light shows whether touch controls
+	    are on), the wordmark, collapse and close. Dragging the header moves
+	    the window; when collapsed, tapping it opens the window again.
+	  * Status line: on/paused, the camera move in progress (in its axis
+	    colour) and the on/off switch.
+	  * "Gestures" is a legend of what each touch does; "Settings" is a list.
+]]
+
+local UserInputService = game:GetService("UserInputService")
+
+local Config = require(script.Parent.Parent.Config)
+local Maid = require(script.Parent.Parent.Util.Maid)
+local Settings = require(script.Parent.Parent.Settings)
+local Theme = require(script.Parent.Theme)
+local Create = require(script.Parent.Create)
+local Components = require(script.Parent.Components)
+local GestureIcons = require(script.Parent.GestureIcons)
+
+local Color = Theme.Color
+local Font = Theme.Font
+local Size = Theme.Size
+local Radius = Theme.Radius
+
+local DRAG_THRESHOLD = 6
+local HEADER_BUTTONS_WIDTH = 84
+local CONTENT_TOP = Size.Header + Size.Status
+local PAGES_TOP = Size.Tabs + 4
+
+-- Gesture legend: what you do, and what it does (coloured like the camera move).
+local LEGEND = {
+	{ icon = "drag", action = "actDrag", effect = "effDrag", color = Color.Green },
+	{ icon = "tapDrag", action = "actTapDrag", effect = "effTapDrag", color = Color.Red },
+	{ icon = "strip", action = "actStrip", effect = "effStrip", color = Color.Blue },
+	{ icon = "tap", action = "actTap", effect = "effTap" },
+	{ icon = "doubleTap", action = "actDoubleTap", effect = "effDoubleTap" },
+	{ icon = "hold", action = "actHold", effect = "effHold" },
+	{ icon = "twoFingers", action = "actTwoFingers", effect = "effTwoFingers" },
+}
+
+local EMPTY_STATS = {
+	touchBegan = 0,
+	touchChanged = 0,
+	touchEnded = 0,
+	touchFingers = 0,
+	mouseDown = 0,
+	mouseMoves = 0,
+	wheel = 0,
+	pinch = 0,
+	pan = 0,
+}
+
+local function toVector2(position: Vector3): Vector2
+	return Vector2.new(position.X, position.Y)
+end
+
+local function isPointer(input: InputObject): boolean
+	local inputType = input.UserInputType
+	return inputType == Enum.UserInputType.MouseButton1 or inputType == Enum.UserInputType.Touch
+end
+
+local function hex(color: Color3): string
+	local function byte(channel: number): number
+		return math.floor(channel * 255 + 0.5)
+	end
+	return string.format("#%02X%02X%02X", byte(color.R), byte(color.G), byte(color.B))
+end
+
+-- The logo: two peaks, the front one with a light on its summit.
+local function peakLogo(): (Frame, Frame)
+	-- Bars of a peak: `length` long at 60 degrees, meeting at `apex`.
+	local function peak(apex: Vector2, length: number, color: Color3)
+		local dx, dy = length * 0.25, length * 0.433 -- half of cos/sin 60
+		return Components.bar(length, 2, -60, UDim2.fromOffset(apex.X - dx, apex.Y + dy), color),
+			Components.bar(length, 2, 60, UDim2.fromOffset(apex.X + dx, apex.Y + dy), color)
+	end
+	local backLeft, backRight = peak(Vector2.new(17, 8), 8, Color.Dim)
+	local frontLeft, frontRight = peak(Vector2.new(9, 3), 13, Color.Bone)
+	local summit = Create.dot(5, Color.Green, UDim2.fromOffset(9, 0))
+
+	local logo = Create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, Size.Inset, 0.5, 1),
+		Size = UDim2.fromOffset(24, 16),
+		BackgroundTransparency = 1,
+	}, {
+		BackLeft = backLeft,
+		BackRight = backRight,
+		FrontLeft = frontLeft,
+		FrontRight = frontRight,
+		Summit = summit,
+	})
+	for _, part in { frontLeft, frontRight } do
+		part.ZIndex = 2
+	end
+	summit.ZIndex = 3
+	return logo, summit
+end
+
+local Panel = {}
+Panel.__index = Panel
+
+export type Params = {
+	parent: GuiBase2d,
+	settings: any,
+	locale: any,
+	active: boolean,
+	touchDetected: boolean,
+	onActiveChanged: (boolean) -> (),
+	onClose: () -> (),
+}
+
+function Panel.new(params: Params)
+	local self = setmetatable({}, Panel)
+	self._params = params
+	self._settings = params.settings
+	self._locale = params.locale
+	self._maid = Maid.new()
+	self._controls = {}
+	self._visible = false
+	self._visibleToken = 0
+	self._collapseToken = 0
+	self._collapsed = false
+	self._active = params.active
+	self._gesture = nil
+	self._inputSource = nil
+	self._drag = nil
+	self._tab = if self._settings:GetState("tab") == "settings" then "settings" else "gestures"
+
+	self:_build()
+	self:_buildLegend()
+	self:_buildSettings()
+	self:_bindDrag()
+	self:_restorePosition()
+	self:_selectTab(self._tab, true)
+	self:SetTouchDetected(params.touchDetected)
+	self:SetInputStats(nil)
+	self:SetActive(params.active, true)
+
+	self._maid:Give(params.parent:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		if not self._customPosition then
+			self._position = self:_defaultPosition()
+		end
+		self:_applyLayout(true)
+	end))
+	self._maid:Give(self._settings.Changed:Connect(function(key, value)
+		local control = self._controls[key]
+		if control then
+			control.set(value)
+		end
+	end))
+
+	return self
+end
+
+function Panel:_t(key: string, ...: any): string
+	return self._locale:t(key, ...)
+end
+
+-- Construction -------------------------------------------------------------------
+
+function Panel:_build()
+	local inset = Size.Inset
+
+	-- Header: logo, wordmark, collapse, close.
+	local logo, summit = peakLogo()
+	local chevron = Components.ChevronGlyph()
+	local collapseButton = Components.IconButton({
+		glyph = chevron,
+		onActivated = function()
+			self:SetCollapsed(not self._collapsed)
+		end,
+	})
+	collapseButton.instance.Position = UDim2.new(1, -48, 0.5, 0)
+	local closeButton = Components.IconButton({
+		glyph = Components.CloseGlyph(),
+		onActivated = function()
+			self._params.onClose()
+		end,
+	})
+	closeButton.instance.Position = UDim2.new(1, -12, 0.5, 0)
+
+	local dragHandle = Create("TextButton", {
+		Size = UDim2.new(1, -HEADER_BUTTONS_WIDTH, 1, 0),
+		ZIndex = 2,
+	})
+
+	local header = Create("Frame", {
+		Size = UDim2.new(1, 0, 0, Size.Header),
+		BackgroundTransparency = 1,
+		ZIndex = 2,
+	}, {
+		Grip = Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0),
+			Position = UDim2.new(0.5, 0, 0, 5),
+			Size = UDim2.fromOffset(22, 3),
+			BackgroundColor3 = Color.Dim,
+			BackgroundTransparency = 0.3,
+		}, { Create.round() }),
+		Logo = logo,
+		Wordmark = Create("TextLabel", {
+			Position = UDim2.fromOffset(inset + 32, 0),
+			Size = UDim2.new(1, -(inset + 32) - HEADER_BUTTONS_WIDTH, 1, 0),
+			Text = "touch peak",
+			FontFace = Font.Wordmark,
+			TextSize = 13,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		}),
+		DragHandle = dragHandle,
+		Collapse = collapseButton.instance,
+		Close = closeButton.instance,
+	})
+
+	-- Status line: state, current move, switch.
+	local switch = Components.Switch({
+		value = self._active,
+		onChanged = function(value)
+			self._params.onActiveChanged(value)
+		end,
+	})
+	switch.instance.Position = UDim2.new(1, -inset, 0.5, 0)
+
+	local statusLabel = Create("TextLabel", {
+		Position = UDim2.fromOffset(inset, 0),
+		Size = UDim2.new(1, -inset * 2 - 52, 1, 0),
+		FontFace = Font.Medium,
+		TextSize = 14,
+		RichText = true,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+
+	local status = Create("Frame", {
+		Position = UDim2.fromOffset(0, Size.Header),
+		Size = UDim2.new(1, 0, 0, Size.Status),
+		BackgroundTransparency = 1,
+	}, {
+		Label = statusLabel,
+		Switch = switch.instance,
+	})
+
+	-- Tabs and their pages.
+	local tabs = Components.Tabs({
+		options = {
+			{ id = "gestures", label = self:_t("tabGestures") },
+			{ id = "settings", label = self:_t("tabSettings") },
+		},
+		value = self._tab,
+		onChanged = function(id)
+			self:_selectTab(id)
+		end,
+	})
+	tabs.instance.Position = UDim2.fromOffset(inset, 0)
+	tabs.instance.Size = UDim2.new(1, -inset * 2, 0, Size.Tabs)
+
+	local function page(): ScrollingFrame
+		return Create("ScrollingFrame", {
+			Size = UDim2.fromScale(1, 1),
+		}, {
+			Create.padding(4, inset, inset, inset),
+			Create.list(0),
+		})
+	end
+	local legendPage = page()
+	local settingsPage = page()
+
+	local pages = Create("Frame", {
+		Position = UDim2.fromOffset(0, PAGES_TOP),
+		Size = UDim2.new(1, 0, 1, -PAGES_TOP),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+	}, {
+		Gestures = legendPage,
+		Settings = settingsPage,
+	})
+
+	local content = Create("Frame", {
+		Position = UDim2.fromOffset(0, CONTENT_TOP),
+		Size = UDim2.new(1, 0, 1, -CONTENT_TOP),
+		BackgroundTransparency = 1,
+	}, {
+		Tabs = tabs.instance,
+		Rule = Create("Frame", {
+			Position = UDim2.fromOffset(inset, Size.Tabs),
+			Size = UDim2.new(1, -inset * 2, 0, 1),
+			BackgroundColor3 = Color.Bone,
+			BackgroundTransparency = 0.92,
+		}),
+		Pages = pages,
+	})
+
+	local body = Create("Frame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Color.Graphite,
+		ClipsDescendants = true,
+		ZIndex = 2,
+	}, {
+		Create.corner(Radius.Panel),
+		Create.stroke(Color.Bone, 0.9),
+		Header = header,
+		Status = status,
+		Content = content,
+	})
+
+	local scale = Create("UIScale", { Scale = 1 })
+	local root = Create("Frame", {
+		Name = "TouchPeakPanel",
+		Size = UDim2.fromOffset(Size.PanelWidth, Size.PanelHeight),
+		BackgroundTransparency = 1,
+		Visible = false,
+		ZIndex = 10,
+	}, {
+		Scale = scale,
+		Body = body,
+	})
+
+	for index, layer in { { 2, 0.8 }, { 12, 0.92 } } do
+		local spread, transparency = layer[1], layer[2]
+		Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, 0, 0.5, 2 + index * 2),
+			Size = UDim2.new(1, spread, 1, spread),
+			BackgroundColor3 = Color.Black,
+			BackgroundTransparency = transparency,
+			ZIndex = 1,
+			Parent = root,
+		}, { Create.corner(Radius.Panel + spread / 2) })
+	end
+
+	root.Parent = self._params.parent
+	self._maid:Give(root)
+
+	self._root = root
+	self._scale = scale
+	self._body = body
+	self._status = status
+	self._content = content
+	self._chevron = chevron
+	self._dragHandle = dragHandle
+	self._summit = summit
+	self._statusLabel = statusLabel
+	self._switch = switch
+	self._tabs = tabs
+	self._legendPage = legendPage
+	self._settingsPage = settingsPage
+end
+
+function Panel:_buildLegend()
+	for index, entry in LEGEND do
+		Create("Frame", {
+			Size = UDim2.new(1, 0, 0, 50),
+			BackgroundTransparency = 1,
+			LayoutOrder = index,
+			Parent = self._legendPage,
+		}, {
+			Glyph = Create("Frame", {
+				AnchorPoint = Vector2.new(0, 0.5),
+				Position = UDim2.fromScale(0, 0.5),
+				Size = UDim2.fromOffset(28, 28),
+				BackgroundTransparency = 1,
+			}, { Icon = GestureIcons[entry.icon]() }),
+			Action = Create("TextLabel", {
+				Position = UDim2.fromOffset(44, 8),
+				Size = UDim2.new(1, -44, 0, 18),
+				Text = self:_t(entry.action),
+				FontFace = Font.Medium,
+				TextSize = 14,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+			}),
+			Effect = Create("TextLabel", {
+				Position = UDim2.fromOffset(44, 27),
+				Size = UDim2.new(1, -44, 0, 16),
+				Text = self:_t(entry.effect),
+				TextSize = 13,
+				TextColor3 = entry.color or Color.Ash,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+			}),
+		})
+	end
+end
+
+function Panel:_buildSettings()
+	local settings = self._settings
+	local page = self._settingsPage
+	local order = 0
+
+	local function add(instance: GuiObject)
+		order += 1
+		instance.LayoutOrder = order
+		instance.Parent = page
+	end
+
+	local function group(key: string)
+		add(Components.GroupTitle(self:_t(key)))
+	end
+
+	local function stepper(key: string, title: string)
+		local control = Components.Stepper({
+			value = settings:Get(key),
+			min = Settings.SensitivityRange.min,
+			max = Settings.SensitivityRange.max,
+			step = 0.25,
+			onChanged = function(value)
+				settings:Set(key, value)
+			end,
+		})
+		self._controls[key] = control
+		add(Components.Row({ title = self:_t(title), control = control.instance, controlWidth = 104 }))
+	end
+
+	local function switch(key: string, title: string, hint: string?)
+		local control = Components.Switch({
+			value = settings:Get(key),
+			onChanged = function(value)
+				settings:Set(key, value)
+			end,
+		})
+		self._controls[key] = control
+		add(Components.Row({
+			title = self:_t(title),
+			hint = if hint then self:_t(hint) else nil,
+			control = control.instance,
+			controlWidth = 40,
+		}))
+	end
+
+	local function choice(key: string, title: string, options, width: number)
+		local control = Components.Segmented({
+			options = options,
+			value = settings:Get(key),
+			width = width,
+			onChanged = function(id)
+				settings:Set(key, id)
+			end,
+		})
+		self._controls[key] = control
+		add(Components.Row({ title = self:_t(title), control = control.instance, controlWidth = width }))
+	end
+
+	group("groupSensitivity")
+	stepper("rotateSensitivity", "rotateSpeed")
+	stepper("zoomSensitivity", "zoomSpeed")
+	stepper("panSensitivity", "panSpeed")
+
+	group("groupCamera")
+	choice("rotateMode", "rotateMode", {
+		{ id = "orbit", label = self:_t("rotateModeOrbit") },
+		{ id = "look", label = self:_t("rotateModeLook") },
+	}, 150)
+	switch("inertia", "inertia", "inertiaHint")
+	switch("invertRotate", "invertRotate", "invertRotateHint")
+	switch("invertPan", "invertPan", "invertPanHint")
+	switch("combineGestures", "combineGestures", "combineGesturesHint")
+
+	group("groupZoom")
+	switch("showZoomStrip", "showZoomStrip", "showZoomStripHint")
+	choice("zoomSide", "zoomSide", {
+		{ id = "left", label = self:_t("zoomSideLeft") },
+		{ id = "right", label = self:_t("zoomSideRight") },
+	}, 124)
+
+	group("groupSelection")
+	switch("selectModels", "selectModels", "selectModelsHint")
+	switch("showTouches", "showTouches", "showTouchesHint")
+	switch("mouseInput", "mouseInput", "mouseInputHint")
+	choice("language", "language", {
+		{ id = "auto", label = self:_t("languageAuto") },
+		{ id = "pl", label = "PL" },
+		{ id = "en", label = "EN" },
+	}, 138)
+
+	group("groupDiagnostics")
+	self._diagnostics = {}
+	for _, key in
+		{
+			"touchScreen",
+			"diagInput",
+			"diagTouchEvents",
+			"diagTouchFingers",
+			"diagMouseClicks",
+			"diagMouseMoves",
+			"diagPinch",
+			"version",
+		}
+	do
+		local row, value = Components.ValueRow(self:_t(key))
+		add(row)
+		self._diagnostics[key] = value
+	end
+	self._diagnostics.version.Text = Config.Version
+
+	local spacer = Create("Frame", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1 })
+	add(spacer)
+	local reset = Components.Button({
+		text = self:_t("reset"),
+		onActivated = function()
+			settings:Reset()
+		end,
+	})
+	add(reset.instance)
+end
+
+-- Dragging -----------------------------------------------------------------------
+
+function Panel:_bindDrag()
+	self._maid:Give(self._dragHandle.InputBegan:Connect(function(input)
+		if self._drag or not isPointer(input) then
+			return
+		end
+		self._drag = {
+			input = input,
+			isTouch = input.UserInputType == Enum.UserInputType.Touch,
+			start = toVector2(input.Position),
+			origin = self._position,
+			moved = false,
+		}
+	end))
+
+	self._maid:Give(UserInputService.InputChanged:Connect(function(input)
+		local drag = self._drag
+		if not drag then
+			return
+		end
+		if drag.isTouch then
+			if input ~= drag.input then
+				return
+			end
+		elseif input.UserInputType ~= Enum.UserInputType.MouseMovement then
+			return
+		end
+
+		local delta = toVector2(input.Position) - drag.start
+		if not drag.moved and delta.Magnitude < DRAG_THRESHOLD then
+			return
+		end
+		drag.moved = true
+		self._position = self:_clamp(drag.origin + delta, self:_targetSize())
+		self._root.Position = UDim2.fromOffset(self._position.X, self._position.Y)
+	end))
+
+	self._maid:Give(UserInputService.InputEnded:Connect(function(input)
+		local drag = self._drag
+		if not drag then
+			return
+		end
+		local released = if drag.isTouch
+			then input == drag.input
+			else input.UserInputType == Enum.UserInputType.MouseButton1
+		if not released then
+			return
+		end
+
+		self._drag = nil
+		if drag.moved then
+			self._customPosition = true
+			self._settings:SetState("position", { x = self._position.X, y = self._position.Y })
+		elseif self._collapsed then
+			-- A plain tap on the collapsed header opens the window again.
+			self:SetCollapsed(false)
+		end
+	end))
+end
+
+-- Layout ---------------------------------------------------------------------------
+
+function Panel:_screenSize(): Vector2
+	return self._params.parent.AbsoluteSize
+end
+
+function Panel:_expandedHeight(): number
+	local available = self:_screenSize().Y - Size.ScreenMargin * 2
+	return math.max(CONTENT_TOP + 200, math.min(Size.PanelHeight, available))
+end
+
+function Panel:_targetSize(): Vector2
+	if self._collapsed then
+		return Vector2.new(Size.CollapsedWidth, Size.Header)
+	end
+	return Vector2.new(Size.PanelWidth, self:_expandedHeight())
+end
+
+function Panel:_clamp(position: Vector2, size: Vector2): Vector2
+	local screen = self:_screenSize()
+	local margin = Size.ScreenMargin
+	local maxX = math.max(margin, screen.X - size.X - margin)
+	local maxY = math.max(margin, screen.Y - size.Y - margin)
+	return Vector2.new(math.clamp(position.X, margin, maxX), math.clamp(position.Y, margin, maxY))
+end
+
+-- Until the user drags the window it lives in the top-right corner of the viewport.
+function Panel:_defaultPosition(): Vector2
+	return Vector2.new(self:_screenSize().X - Size.PanelWidth - 20, 20)
+end
+
+function Panel:_restorePosition()
+	local saved = self._settings:GetState("position")
+	if type(saved) == "table" and type(saved.x) == "number" and type(saved.y) == "number" then
+		self._customPosition = true
+		self._position = Vector2.new(saved.x, saved.y)
+	else
+		self._customPosition = false
+		self._position = self:_defaultPosition()
+	end
+	self:_applyLayout(true)
+end
+
+function Panel:_applyLayout(instant: boolean?)
+	local size = self:_targetSize()
+	self._position = self:_clamp(self._position, size)
+	Create.animate(self._root, if instant then nil else Theme.Tween.Smooth, {
+		Size = UDim2.fromOffset(size.X, size.Y),
+		Position = UDim2.fromOffset(self._position.X, self._position.Y),
+	})
+end
+
+function Panel:_selectTab(id: string, instant: boolean?)
+	self._tab = id
+	local info = if instant then nil else Theme.Tween.Smooth
+	Create.animate(self._legendPage, info, {
+		Position = UDim2.fromScale(if id == "gestures" then 0 else -1, 0),
+	})
+	Create.animate(self._settingsPage, info, {
+		Position = UDim2.fromScale(if id == "settings" then 0 else 1, 0),
+	})
+	if instant then
+		self._tabs.set(id, true)
+	end
+	self._settings:SetState("tab", id)
+end
+
+-- Public API -------------------------------------------------------------------------
+
+function Panel:IsVisible(): boolean
+	return self._visible
+end
+
+function Panel:IsCollapsed(): boolean
+	return self._collapsed
+end
+
+function Panel:SetVisible(visible: boolean, instant: boolean?)
+	if visible == self._visible then
+		return
+	end
+	self._visible = visible
+	self._visibleToken += 1
+	self._drag = nil
+
+	if visible then
+		self._root.Visible = true
+		if instant then
+			self._scale.Scale = 1
+		else
+			self._scale.Scale = 0.96
+			Create.tween(self._scale, Theme.Tween.Smooth, { Scale = 1 })
+		end
+	elseif instant then
+		self._root.Visible = false
+	else
+		local token = self._visibleToken
+		Create.tween(self._scale, Theme.Tween.Close, { Scale = 0.96 })
+		task.delay(Theme.Tween.Close.Time, function()
+			if token == self._visibleToken then
+				self._root.Visible = false
+			end
+		end)
+	end
+end
+
+function Panel:SetCollapsed(collapsed: boolean, instant: boolean?)
+	self._collapsed = collapsed
+	self._collapseToken += 1
+	local info = if instant then nil else Theme.Tween.Smooth
+
+	Create.animate(self._chevron, info, { Rotation = if collapsed then 180 else 0 })
+
+	if not collapsed then
+		self._content.Visible = true
+		self._status.Visible = true
+	elseif instant then
+		self._content.Visible = false
+		self._status.Visible = false
+	else
+		-- Hide the content (and its inputs) once the window has shrunk.
+		local token = self._collapseToken
+		task.delay(Theme.Tween.Smooth.Time, function()
+			if token == self._collapseToken then
+				self._content.Visible = false
+				self._status.Visible = false
+			end
+		end)
+	end
+
+	self:_applyLayout(instant)
+end
+
+function Panel:SetActive(active: boolean, instant: boolean?)
+	self._active = active
+	self._switch.set(active, instant)
+	self:_refreshStatus()
+end
+
+-- `viaMouse` is true when the only "finger" is Studio's mouse pointer.
+function Panel:SetTouchCount(count: number, viaMouse: boolean?)
+	if count > 0 then
+		self._inputSource = if viaMouse then "inputMouse" else "inputTouch"
+		self._diagnostics.diagInput.Text = self:_t(self._inputSource)
+	end
+end
+
+function Panel:SetInputStats(stats)
+	local s = stats or EMPTY_STATS
+	local rows = self._diagnostics
+	rows.diagTouchEvents.Text = tostring(s.touchBegan + s.touchChanged + s.touchEnded)
+	rows.diagTouchFingers.Text = tostring(s.touchFingers)
+	rows.diagTouchFingers.TextColor3 = if s.touchFingers >= 2 then Color.Green else Color.Bone
+	rows.diagMouseClicks.Text = tostring(s.mouseDown)
+	rows.diagMouseMoves.Text = tostring(s.mouseMoves)
+	rows.diagPinch.Text = tostring(s.pinch)
+	if not self._inputSource then
+		rows.diagInput.Text = self:_t("inputNone")
+	end
+end
+
+function Panel:SetGesture(gesture: string?)
+	self._gesture = gesture
+	self:_refreshStatus()
+end
+
+function Panel:SetTouchDetected(detected: boolean)
+	local label = self._diagnostics.touchScreen
+	label.Text = self:_t(if detected then "detected" else "notDetected")
+	label.TextColor3 = if detected then Color.Bone else Color.Amber
+end
+
+-- True when a screen point lies on the window (so it should not move the camera).
+function Panel:ContainsPoint(point: Vector2): boolean
+	if not self._root.Visible then
+		return false
+	end
+	local position = self._body.AbsolutePosition
+	local size = self._body.AbsoluteSize
+	local margin = 6
+	return point.X >= position.X - margin
+		and point.X <= position.X + size.X + margin
+		and point.Y >= position.Y - margin
+		and point.Y <= position.Y + size.Y + margin
+end
+
+function Panel:_refreshStatus()
+	local active = self._active
+	self._summit.BackgroundColor3 = if active then Color.Green else Color.Amber
+
+	local text = self:_t(if active then "statusOn" else "statusPaused")
+	self._statusLabel.TextColor3 = if active then Color.Bone else Color.Amber
+	local gesture = self._gesture
+	if active and gesture then
+		local color = Theme.GestureColor[gesture] or Color.Bone
+		text ..= `   <font color="{hex(color)}">{self._locale:gesture(gesture)}</font>`
+	end
+	self._statusLabel.Text = text
+end
+
+function Panel:Destroy()
+	self._maid:Clean()
+end
+
+return Panel
+]]></ProtectedString>
+					</Properties>
+				</Item>
+				<Item class="ModuleScript" referent="RBX20">
+					<Properties>
+						<string name="Name">Theme</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Visual language: Roblox Studio's transform gizmo.
+
+	Colour carries meaning and nothing else. The three camera moves use the
+	colours of Studio's axis handles (rotate around Y = green, pan = X red,
+	zoom along Z = blue); everything else is graphite and bone white.
+]]
+
+local UI_FAMILY = "rbxasset://fonts/families/BuilderSans.json"
+local WORDMARK_FAMILY = "rbxasset://fonts/families/Michroma.json"
+
+local Theme = {}
+
+Theme.Font = {
+	Regular = Font.new(UI_FAMILY, Enum.FontWeight.Regular),
+	Medium = Font.new(UI_FAMILY, Enum.FontWeight.Medium),
+	SemiBold = Font.new(UI_FAMILY, Enum.FontWeight.SemiBold),
+	Bold = Font.new(UI_FAMILY, Enum.FontWeight.Bold),
+	Wordmark = Font.new(WORDMARK_FAMILY, Enum.FontWeight.Regular),
+}
+
+Theme.Color = {
+	Graphite = Color3.fromRGB(35, 37, 39), -- panel body
+	Well = Color3.fromRGB(26, 27, 29), -- recessed tracks
+	Ridge = Color3.fromRGB(52, 55, 59), -- raised parts
+	Bone = Color3.fromRGB(236, 232, 223), -- text, knobs, "on"
+	Ash = Color3.fromRGB(143, 141, 134), -- secondary text
+	Dim = Color3.fromRGB(96, 95, 91), -- disabled, ticks
+	Black = Color3.fromRGB(0, 0, 0),
+
+	Red = Color3.fromRGB(239, 83, 80), -- pan (X)
+	Green = Color3.fromRGB(92, 201, 122), -- rotate (Y), "on"
+	Blue = Color3.fromRGB(76, 141, 246), -- zoom (Z)
+	Amber = Color3.fromRGB(233, 180, 76), -- paused
+}
+
+-- Colour of each camera move, as reported by the gesture recognizer.
+Theme.GestureColor = {
+	rotate = Theme.Color.Green,
+	pan = Theme.Color.Red,
+	zoom = Theme.Color.Blue,
+	both = Theme.Color.Bone,
+}
+
+Theme.Tween = {
+	Fast = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+	Smooth = TweenInfo.new(0.22, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+	Close = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+}
+
+Theme.Radius = {
+	Panel = 14,
+	Control = 8,
+	Tag = 6,
+}
+
+Theme.Size = {
+	PanelWidth = 312,
+	PanelHeight = 500,
+	CollapsedWidth = 232,
+	Header = 46,
+	Status = 34,
+	Tabs = 40,
+	Inset = 16,
+	ScreenMargin = 10,
+}
+
+return Theme
+]]></ProtectedString>
+					</Properties>
+				</Item>
+				<Item class="ModuleScript" referent="RBX21">
+					<Properties>
+						<string name="Name">ZoomStrip</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Zoom control along the edge of the viewport, drawn like the distance
+	scale on a lens barrel: the tick marks travel with your finger and the
+	camera follows. Drag up to move in, down to move out.
+
+	It reports finger movement in pixels (Moved(dy)); App turns that into
+	camera zoom, so the strip itself knows nothing about the camera.
+]]
+
+local UserInputService = game:GetService("UserInputService")
+
+local Theme = require(script.Parent.Theme)
+local Create = require(script.Parent.Create)
+local Components = require(script.Parent.Components)
+local Maid = require(script.Parent.Parent.Util.Maid)
+local Signal = require(script.Parent.Parent.Util.Signal)
+
+local Color = Theme.Color
+
+local WIDTH = 46
+local EDGE_GAP = 14
+local CAP = 30 -- space for the + / − marks at the ends
+local TICK_SPACING = 11
+local MAJOR_EVERY = 5
+local CYCLE = TICK_SPACING * MAJOR_EVERY
+
+local function toVector2(position: Vector3): Vector2
+	return Vector2.new(position.X, position.Y)
+end
+
+local function isPointer(input: InputObject): boolean
+	local inputType = input.UserInputType
+	return inputType == Enum.UserInputType.MouseButton1 or inputType == Enum.UserInputType.Touch
+end
+
+local function isLeftButtonDown(): boolean
+	local ok, pressed = pcall(function()
+		return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+	end)
+	return not ok or pressed ~= false
+end
+
+local ZoomStrip = {}
+ZoomStrip.__index = ZoomStrip
+
+export type Params = {
+	parent: GuiBase2d,
+	side: string, -- "left" | "right"
+}
+
+function ZoomStrip.new(params: Params)
+	local self = setmetatable({}, ZoomStrip)
+	self._params = params
+	self._maid = Maid.new()
+	self._tracking = nil -- { input, isTouch, last }
+	self._scroll = 0
+	self._ticks = {}
+
+	self.Began = Signal.new()
+	self.Moved = Signal.new()
+	self.Ended = Signal.new()
+
+	local ticks = Create("Frame", {
+		Position = UDim2.fromOffset(0, CAP),
+		Size = UDim2.new(1, 0, 1, -CAP * 2),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+	})
+
+	local index = Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(1, -10, 0, 2),
+		BackgroundColor3 = Color.Blue,
+		ZIndex = 3,
+	}, { Create.round() })
+
+	local function mark(plus: boolean, position: UDim2): Frame
+		return Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = position,
+			Size = UDim2.fromOffset(12, 12),
+			BackgroundTransparency = 1,
+		}, {
+			H = Components.bar(10, 2, 0, nil, Color.Ash),
+			V = if plus then Components.bar(2, 10, 0, nil, Color.Ash) else nil,
+		})
+	end
+
+	local stroke = Create.stroke(Color.Bone, 0.88)
+	local body = Create("Frame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Color.Graphite,
+		BackgroundTransparency = 0.04,
+		ZIndex = 2,
+	}, {
+		Create.corner(12),
+		Stroke = stroke,
+		Plus = mark(true, UDim2.new(0.5, 0, 0, CAP / 2)),
+		Minus = mark(false, UDim2.new(0.5, 0, 1, -CAP / 2)),
+		Ticks = ticks,
+		Index = index,
+	})
+
+	local root = Create("Frame", {
+		Name = "TouchPeakZoomStrip",
+		BackgroundTransparency = 1,
+		Visible = false,
+		ZIndex = 9,
+	}, {
+		Body = body,
+		Shadow = Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, 0, 0.5, 3),
+			Size = UDim2.new(1, 8, 1, 8),
+			BackgroundColor3 = Color.Black,
+			BackgroundTransparency = 0.86,
+			ZIndex = 1,
+		}, { Create.corner(16) }),
+	})
+
+	self._root = root
+	self._body = body
+	self._ticksFrame = ticks
+	self._stroke = stroke
+	self._index = index
+
+	self:SetSide(params.side)
+	self:_layout()
+
+	self._maid:Give(params.parent:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		self:_layout()
+	end))
+
+	self._maid:Give(body.InputBegan:Connect(function(input)
+		if self._tracking or not isPointer(input) then
+			return
+		end
+		local position = toVector2(input.Position)
+		self._tracking = {
+			input = input,
+			isTouch = input.UserInputType == Enum.UserInputType.Touch,
+			last = position,
+		}
+		Create.tween(stroke, Theme.Tween.Fast, { Color = Color.Blue, Transparency = 0.25 })
+		Create.tween(index, Theme.Tween.Fast, { Size = UDim2.new(1, -4, 0, 2) })
+		self.Began:Fire()
+	end))
+
+	self._maid:Give(UserInputService.InputChanged:Connect(function(input)
+		local track = self._tracking
+		if not track then
+			return
+		end
+		if track.isTouch then
+			if input ~= track.input then
+				return
+			end
+		elseif input.UserInputType ~= Enum.UserInputType.MouseMovement then
+			return
+		elseif not isLeftButtonDown() then
+			-- The release happened somewhere we could not see it.
+			self:_release()
+			return
+		end
+
+		local position = toVector2(input.Position)
+		local dy = position.Y - track.last.Y
+		track.last = position
+		if dy ~= 0 then
+			self:_scrollBy(dy)
+			self.Moved:Fire(dy)
+		end
+	end))
+
+	self._maid:Give(UserInputService.InputEnded:Connect(function(input)
+		local track = self._tracking
+		if not track then
+			return
+		end
+		if
+			(track.isTouch and input == track.input)
+			or (not track.isTouch and input.UserInputType == Enum.UserInputType.MouseButton1)
+		then
+			self:_release()
+		end
+	end))
+
+	root.Parent = params.parent
+	self._maid:Give(root)
+	return self
+end
+
+function ZoomStrip:_layout()
+	local screenHeight = self._params.parent.AbsoluteSize.Y
+	local height = math.clamp(math.floor(screenHeight * 0.46), 200, 360)
+	self._root.Size = UDim2.fromOffset(WIDTH, height)
+
+	-- Enough ticks to fill the track while it scrolls by one major cycle.
+	local trackHeight = height - CAP * 2
+	local needed = math.ceil(trackHeight / TICK_SPACING) + MAJOR_EVERY + 1
+	for index = #self._ticks + 1, needed do
+		local major = (index - 1) % MAJOR_EVERY == 0
+		self._ticks[index] = Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Size = UDim2.fromOffset(if major then 18 else 9, if major then 2 else 1),
+			BackgroundColor3 = Color.Bone,
+			BackgroundTransparency = if major then 0.35 else 0.7,
+			Parent = self._ticksFrame,
+		})
+	end
+	self:_scrollBy(0)
+end
+
+function ZoomStrip:_scrollBy(dy: number)
+	self._scroll = (self._scroll + dy) % CYCLE
+	local offset = self._scroll - CYCLE
+	for index, tick in self._ticks do
+		tick.Position = UDim2.new(0.5, 0, 0, offset + (index - 1) * TICK_SPACING)
+	end
+end
+
+function ZoomStrip:_release()
+	if not self._tracking then
+		return
+	end
+	self._tracking = nil
+	Create.tween(self._stroke, Theme.Tween.Smooth, { Color = Color.Bone, Transparency = 0.88 })
+	Create.tween(self._index, Theme.Tween.Smooth, { Size = UDim2.new(1, -10, 0, 2) })
+	self.Ended:Fire()
+end
+
+function ZoomStrip:SetSide(side: string)
+	if side == "right" then
+		self._root.AnchorPoint = Vector2.new(1, 0.5)
+		self._root.Position = UDim2.new(1, -EDGE_GAP, 0.5, 0)
+	else
+		self._root.AnchorPoint = Vector2.new(0, 0.5)
+		self._root.Position = UDim2.new(0, EDGE_GAP, 0.5, 0)
+	end
+end
+
+function ZoomStrip:SetVisible(visible: boolean)
+	self._root.Visible = visible
+	if not visible then
+		self:_release()
+	end
+end
+
+function ZoomStrip:IsVisible(): boolean
+	return self._root.Visible
+end
+
+function ZoomStrip:IsHeld(): boolean
+	return self._tracking ~= nil
+end
+
+-- True when a screen point lies on the strip (so it should not move the camera).
+function ZoomStrip:ContainsPoint(point: Vector2): boolean
+	if not self._root.Visible then
+		return false
+	end
+	local position, size = self._body.AbsolutePosition, self._body.AbsoluteSize
+	local margin = 8
+	return point.X >= position.X - margin
+		and point.X <= position.X + size.X + margin
+		and point.Y >= position.Y - margin
+		and point.Y <= position.Y + size.Y + margin
+end
+
+function ZoomStrip:Destroy()
+	self._tracking = nil
+	self._maid:Clean()
+end
+
+return ZoomStrip
+]]></ProtectedString>
+					</Properties>
+				</Item>
+			</Item>
+			<Item class="Folder" referent="RBX22">
+				<Properties>
+					<string name="Name">Util</string>
+				</Properties>
+				<Item class="ModuleScript" referent="RBX23">
+					<Properties>
+						<string name="Name">Maid</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Collects connections, instances, tweens and cleanup callbacks so they can
+	be released together.
+]]
+
+local Maid = {}
+Maid.__index = Maid
+
+function Maid.new()
+	return setmetatable({ _tasks = {} }, Maid)
+end
+
+function Maid:Give<T>(task: T): T
+	table.insert(self._tasks, task)
+	return task
+end
+
+local function cleanup(item)
+	local kind = typeof(item)
+	if kind == "RBXScriptConnection" then
+		item:Disconnect()
+	elseif kind == "Instance" then
+		if item:IsA("Tween") then
+			item:Cancel()
+		end
+		item:Destroy()
+	elseif kind == "function" then
+		item()
+	elseif kind == "thread" then
+		pcall(task.cancel, item)
+	elseif kind == "table" then
+		if item.Disconnect then
+			item:Disconnect()
+		elseif item.Destroy then
+			item:Destroy()
+		end
+	end
+end
+
+function Maid:Clean()
+	local tasks = self._tasks
+	self._tasks = {}
+	-- Release in reverse order: things created last usually depend on things created first.
+	for index = #tasks, 1, -1 do
+		cleanup(tasks[index])
+	end
+end
+
+Maid.Destroy = Maid.Clean
+
+return Maid
+]]></ProtectedString>
+					</Properties>
+				</Item>
+				<Item class="ModuleScript" referent="RBX24">
+					<Properties>
+						<string name="Name">Signal</string>
+						<ProtectedString name="Source"><![CDATA[--[[
+	Minimal synchronous signal.
+
+	Handlers run immediately, in the order they were connected, which keeps the
+	gesture pipeline deterministic (and easy to test outside of Roblox).
+]]
+
+local Connection = {}
+Connection.__index = Connection
+
+function Connection:Disconnect()
+	if not self.Connected then
+		return
+	end
+	self.Connected = false
+
+	local connections = self._signal._connections
+	local index = table.find(connections, self)
+	if index then
+		table.remove(connections, index)
+	end
+end
+
+local Signal = {}
+Signal.__index = Signal
+
+function Signal.new()
+	return setmetatable({ _connections = {} }, Signal)
+end
+
+function Signal:Connect(callback: (...any) -> ())
+	local connection = setmetatable({
+		Connected = true,
+		_signal = self,
+		_callback = callback,
+	}, Connection)
+	table.insert(self._connections, connection)
+	return connection
+end
+
+function Signal:Fire(...)
+	-- Iterate over a snapshot so handlers may connect/disconnect while firing.
+	for _, connection in table.clone(self._connections) do
+		if connection.Connected then
+			connection._callback(...)
+		end
+	end
+end
+
+function Signal:DisconnectAll()
+	for _, connection in self._connections do
+		connection.Connected = false
+	end
+	table.clear(self._connections)
+end
+
+Signal.Destroy = Signal.DisconnectAll
+
+return Signal
+]]></ProtectedString>
+					</Properties>
+				</Item>
+			</Item>
+		</Item>
+	</Item>
+</roblox>

@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Builds dist/TouchPeak.rbxmx from src/ without needing Rojo.
+"""Builds the plugin from src/ without needing Rojo.
+
+Two files are written to dist/:
+  TouchPeak.rbxmx  the plugin as a model: drop it into Studio's Plugins folder,
+                   or insert it into a place with "Insert from File...".
+  TouchPeak.rbxlx  a place with the plugin already laid out in ServerStorage,
+                   ready to edit in Studio and publish with "Publish as Plugin...".
 
 The layout matches `rojo build default.project.json`:
   src/init.server.luau  -> Script "TouchPeak" (the plugin entry point)
@@ -7,9 +13,10 @@ The layout matches `rojo build default.project.json`:
   src/<Folder>/         -> Folder <Folder>
 
 Usage:
-  python3 tools/build_plugin.py            # write dist/TouchPeak.rbxmx
+  python3 tools/build_plugin.py            # write both files to dist/
   python3 tools/build_plugin.py --check    # fail if dist/ is out of date
   python3 tools/build_plugin.py --output "%LOCALAPPDATA%/Roblox/Plugins/TouchPeak.rbxmx"
+      (a path ending in .rbxlx gets the place, anything else the model)
 """
 
 from __future__ import annotations
@@ -22,8 +29,9 @@ from xml.sax.saxutils import escape
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
-DEFAULT_OUTPUT = ROOT / "dist" / "TouchPeak.rbxmx"
+DIST = ROOT / "dist"
 PLUGIN_NAME = "TouchPeak"
+DEFAULT_OUTPUTS = [DIST / f"{PLUGIN_NAME}.rbxmx", DIST / f"{PLUGIN_NAME}.rbxlx"]
 
 
 class Builder:
@@ -69,38 +77,52 @@ def folder_children(builder: Builder, directory: Path):
     return children
 
 
-def build() -> str:
+def build(place: bool) -> str:
     builder = Builder()
     builder.lines.append(
         '<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" '
         'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
         'xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">'
     )
-    entry = SRC / "init.server.luau"
-    builder.item(1, "Script", PLUGIN_NAME, read(entry), folder_children(builder, SRC))
+
+    def plugin(depth: int) -> None:
+        builder.item(depth, "Script", PLUGIN_NAME, read(SRC / "init.server.luau"), folder_children(builder, SRC))
+
+    if place:
+        # Scripts in ServerStorage never run, so the place is a safe home for the source.
+        builder.item(1, "ServerStorage", "ServerStorage", None, [plugin])
+    else:
+        plugin(1)
     builder.lines.append("</roblox>")
     return "\n".join(builder.lines) + "\n"
 
 
+def content_for(path: Path) -> str:
+    return build(place=path.suffix.lower() == ".rbxlx")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output", type=Path, help="write only this file (.rbxlx = place, otherwise model)")
     parser.add_argument("--check", action="store_true", help="verify the output is up to date")
     args = parser.parse_args()
 
-    content = build()
-    output = Path(os.path.expandvars(str(args.output))).expanduser()
+    outputs = DEFAULT_OUTPUTS
+    if args.output:
+        outputs = [Path(os.path.expandvars(str(args.output))).expanduser()]
 
     if args.check:
-        if not output.exists() or output.read_text(encoding="utf-8") != content:
-            print(f"{output} is out of date; run python3 tools/build_plugin.py", file=sys.stderr)
-            return 1
-        print(f"{output} is up to date")
-        return 0
+        stale = [p for p in outputs if not p.exists() or p.read_text(encoding="utf-8") != content_for(p)]
+        for path in stale:
+            print(f"{path} is out of date; run python3 tools/build_plugin.py", file=sys.stderr)
+        if not stale:
+            print("dist/ is up to date")
+        return 1 if stale else 0
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(content, encoding="utf-8", newline="\n")
-    print(f"Wrote {output}")
+    for path in outputs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content_for(path), encoding="utf-8", newline="\n")
+        print(f"Wrote {path}")
     return 0
 
 

@@ -1,0 +1,11 @@
+{
+  "name": "TouchPeak",
+  "tree": {
+    "$className": "DataModel",
+    "ServerStorage": {
+      "TouchPeak": {
+        "$path": "src"
+      }
+    }
+  }
+}

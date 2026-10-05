@@ -65,16 +65,40 @@ Ustawienia zapisują się w Studio.
 
 ## Instalacja
 
-1. Pobierz [`dist/TouchPeak.rbxmx`](dist/TouchPeak.rbxmx).
-2. W Studio otwórz **Plugins → Plugins Folder** i wrzuć tam plik
-   (Windows: `%LOCALAPPDATA%\Roblox\Plugins`, macOS: `~/Documents/Roblox/Plugins`).
-3. Uruchom Studio ponownie.
+W `dist/` są dwa pliki z tym samym pluginem:
 
-Z Rojo: `rojo build default.project.json --plugin TouchPeak.rbxmx`.
-Bez Rojo: `python tools/build_plugin.py --output "%LOCALAPPDATA%/Roblox/Plugins/TouchPeak.rbxmx"`.
+| Plik | Do czego |
+| --- | --- |
+| [`TouchPeak.rbxlx`](dist/TouchPeak.rbxlx) | Miejsce (place) z pluginem rozłożonym w ServerStorage – do edycji i publikacji |
+| [`TouchPeak.rbxmx`](dist/TouchPeak.rbxmx) | Sam plugin jako model – do folderu Plugins albo do wstawienia w dowolne miejsce |
 
-Ikona przycisku jest opcjonalna: wgraj [`assets/icon.png`](assets/icon.png) jako Decal, wklej
-`rbxassetid://<id>` do `ToolbarIcon` w [`src/Config.luau`](src/Config.luau) i zbuduj plugin.
+Żeby tylko używać pluginu: wrzuć `TouchPeak.rbxmx` do folderu z **Plugins → Plugins Folder**
+(Windows: `%LOCALAPPDATA%\Roblox\Plugins`, macOS: `~/Documents/Roblox/Plugins`) i uruchom
+Studio ponownie.
+
+## Edycja i publikacja w Creator Store
+
+1. Otwórz `dist/TouchPeak.rbxlx` w Studio (**File → Open from File**). Plugin leży w
+   **ServerStorage → TouchPeak**: główny skrypt oraz foldery `Camera`, `Input`, `Selection`,
+   `UI` i `Util` z modułami. Skrypty w ServerStorage się nie uruchamiają, więc możesz je
+   spokojnie edytować.
+
+   Możesz też wstawić plugin do dowolnego innego miejsca: prawy przycisk na **ServerStorage →
+   Insert from File...** i wybierz `TouchPeak.rbxmx`.
+2. Jeśli wcześniej wrzuciłeś `TouchPeak.rbxmx` do folderu Plugins, usuń go stamtąd, żeby w
+   Studio nie było dwóch przycisków Touch Peak.
+3. Żeby przetestować zmiany: prawy przycisk na **TouchPeak → Save as Local Plugin...**.
+4. Żeby opublikować: prawy przycisk na **TouchPeak → Publish as Plugin...**, wpisz nazwę i opis,
+   opublikuj. Potem w Creator Hub (create.roblox.com, **Creations → Plugins**) ustaw ikonę i
+   włącz udostępnianie w Creator Store. Kolejną wersję publikujesz tak samo, wybierając w tym
+   oknie istniejący plugin, żeby go zaktualizować zamiast tworzyć nowy.
+5. Ikona przycisku na pasku jest opcjonalna: wgraj [`assets/icon.png`](assets/icon.png) jako
+   Decal, wklej `rbxassetid://<id>` do `ToolbarIcon` w module **Config** i opublikuj ponownie.
+
+Zmiany zrobione w Studio nie trafiają same do repozytorium. Jeśli wolisz pisać kod w plikach z
+`src/` i mieć go w Studio na żywo, użyj [Rojo](https://rojo.space): `rojo serve place.project.json`
+i wtyczka Rojo w Studio zsynchronizują `src/` z **ServerStorage → TouchPeak**. Gotowe pliki do
+`dist/` buduje `python tools/build_plugin.py` (albo `rojo build place.project.json -o TouchPeak.rbxlx`).
 
 ## Gdy coś nie działa
 
@@ -107,7 +131,7 @@ tools/                      budowanie .rbxmx, ikona, podgląd interfejsu
 lune run tests/run                   # testy
 stylua src tests                     # formatowanie
 selene generate-roblox-std && selene src
-python3 tools/build_plugin.py        # odśwież dist/ po zmianach w src
+python3 tools/build_plugin.py        # odśwież oba pliki w dist/ po zmianach w src
 lune run tools/preview/export && node tools/preview/screenshot.js
 ```
 
