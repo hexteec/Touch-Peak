@@ -13,6 +13,7 @@ local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
 local Settings = require(script.Parent.Settings)
+local PeakInterop = require(script.Parent.PeakInterop)
 local Locale = require(script.Parent.Locale)
 local Signal = require(script.Parent.Util.Signal)
 local Maid = require(script.Parent.Util.Maid)
@@ -66,6 +67,8 @@ function App.new(plugin: Plugin)
 		isBlocked = function(position)
 			return (self.panel ~= nil and self.panel:ContainsPoint(position))
 				or (self.zoomStrip ~= nil and self.zoomStrip:ContainsPoint(position))
+				-- Other Peak plugins' UI (e.g. Optimize Peak's floating dot).
+				or PeakInterop.isBlocked(position, self.gui)
 		end,
 		mouseEnabled = function()
 			return self.settings:Get("mouseInput")
@@ -230,6 +233,7 @@ function App:_ensureGui()
 	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	gui.DisplayOrder = 50
 	gui.Archivable = false
+	PeakInterop.registerGui(gui, "TouchPeak")
 	gui.Parent = CoreGui
 	self.gui = gui
 

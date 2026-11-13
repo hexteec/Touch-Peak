@@ -14,6 +14,7 @@ local UserInputService = game:GetService("UserInputService")
 local Config = require(script.Parent.Parent.Config)
 local Maid = require(script.Parent.Parent.Util.Maid)
 local Settings = require(script.Parent.Parent.Settings)
+local PeakInterop = require(script.Parent.Parent.PeakInterop)
 local Theme = require(script.Parent.Theme)
 local Create = require(script.Parent.Create)
 local Components = require(script.Parent.Components)
@@ -379,6 +380,7 @@ function Panel:_build()
 		}, { shadowCorner })
 	end
 
+	PeakInterop.blockInput(root)
 	root.Parent = self._params.parent
 	self._maid:Give(root)
 

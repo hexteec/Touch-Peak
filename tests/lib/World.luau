@@ -209,6 +209,7 @@ World.CFrame = CFrame
 World.Vector2 = Vector2
 World.Vector3 = Vector3
 World.Enum = Enum
+World.UDim2 = roblox.UDim2
 
 function World.new()
 	local self = setmetatable({}, World)
