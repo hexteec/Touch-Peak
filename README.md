@@ -59,6 +59,13 @@ Przycisk **Touch Peak** na karcie **Plugins** otwiera okno i włącza sterowanie
 
 Ustawienia zapisują się w Studio.
 
+## Razem z Optimize Peak
+
+Touch Peak współpracuje z [Optimize Peak](https://github.com/hexteec/OptimizePeak) (kropka ze
+statystykami optymalizacji). Wtyczki „Peak” oznaczają swoje okna atrybutem `PeakBlocksInput`,
+więc dotknięcie lub przeciągnięcie kropki Optimize Peak nie obraca kamery i nie zmienia
+zaznaczenia, a stuknięcie obiektu przez Touch Peak od razu pokazuje jego statystyki w Optimize Peak.
+
 ## Instalacja
 
 W `dist/` są dwa pliki z tym samym pluginem:

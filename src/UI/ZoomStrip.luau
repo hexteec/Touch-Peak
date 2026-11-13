@@ -14,6 +14,7 @@ local Create = require(script.Parent.Create)
 local Components = require(script.Parent.Components)
 local Maid = require(script.Parent.Parent.Util.Maid)
 local Signal = require(script.Parent.Parent.Util.Signal)
+local PeakInterop = require(script.Parent.Parent.PeakInterop)
 
 local Color = Theme.Color
 
@@ -186,6 +187,7 @@ function ZoomStrip.new(params: Params)
 		end
 	end))
 
+	PeakInterop.blockInput(root)
 	root.Parent = params.parent
 	self._maid:Give(root)
 	return self

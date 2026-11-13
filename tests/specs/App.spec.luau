@@ -61,6 +61,36 @@ return function(t)
 			expect(h.uis.InputBegan:Count()).toBeGreaterThan(0)
 		end)
 
+		it("leaves touches on another Peak plugin's UI alone", function()
+			local h = setup()
+			h.app:Open()
+			expect(h.world.coreGui:FindFirstChild("TouchPeak"):GetAttribute("PeakSuite")).toBe("TouchPeak")
+
+			-- Optimize Peak's floating dot, as another plugin would draw it.
+			local other = h.world.newInstance("ScreenGui")
+			other.Name = "OptimizePeak"
+			other:SetAttribute("PeakSuite", "OptimizePeak")
+			other.Parent = h.world.coreGui
+			local dot = h.world.newInstance("Frame")
+			dot.Size = World.UDim2.fromOffset(44, 44)
+			dot.Position = World.UDim2.fromOffset(14, 400)
+			dot:SetAttribute("PeakBlocksInput", true)
+			dot.Parent = other
+
+			local before = h.world.camera.CFrame
+			local finger = h.touchDown(Vector2.new(36, 422))
+			h.drag(finger, Vector2.new(36, 422), Vector2.new(300, 422))
+			h.touchUp(finger)
+			expect((h.world.camera.CFrame.Position - before.Position).Magnitude).toBeLessThan(0.001)
+
+			-- Hidden, it no longer blocks.
+			dot.Visible = false
+			local again = h.touchDown(Vector2.new(36, 422))
+			h.drag(again, Vector2.new(36, 422), Vector2.new(300, 422))
+			h.touchUp(again)
+			expect((h.world.camera.CFrame.Position - before.Position).Magnitude).toBeGreaterThan(5)
+		end)
+
 		it("rotates the camera with one finger", function()
 			local h = setup()
 			h.app:Open()
